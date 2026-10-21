@@ -97,10 +97,55 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
             import uv
         return uv.find_uv_bin()
 
-    def installCommands(self) -> list:
-        uv = self.uvBinary()
+    def probeEnvironment(self) -> dict:
+        """What the environment's Python runs as (machine, version), or raises."""
+        return environment.parse_json_line(self._run(self.env.probe_command(), timeout=60).splitlines())
+
+    def removeEnvironment(self):
+        shutil.rmtree(self.env.venv, ignore_errors=True)
+
+    def diagnostics(self, verify=False) -> list:
+        """Lines describing the setup, for the log: this process and the hardware, uv, the
+        environment's Python, and (``verify``) torch and haversack in it."""
+        host = environment.host_info()
+        lines = [f"Slicer {slicer.app.applicationVersion}; its Python {host['python']} runs as "
+                 f"{host['process_machine']}"
+                 + (" under Rosetta" if host["translated"] else "")
+                 + ("; hardware: Apple Silicon" if host["hardware_arm64"] and host["system"] == "Darwin" else ""),
+                 f"environment wanted: Python {environment.python_request(host)}"
+                 + (f" (must run as {environment.expected_machine(host)})" if environment.expected_machine(host) else "")]
+        try:
+            import uv
+            ub = uv.find_uv_bin()
+            ver = subprocess.run([ub, "--version"], capture_output=True, text=True, timeout=30,
+                                 env=_clean_env()).stdout.strip()
+            lines.append(f"uv: {ub} ({environment.binary_arch(ub)}) {ver}")
+        except Exception as exc:
+            lines.append(f"uv: not available in Slicer's Python yet ({exc.__class__.__name__}); Install adds it")
         e = self.env
-        return [e.create_command(uv), e.install_command(uv, self.haversackSource(), self.lnqSource())]
+        if not e.python.exists():
+            lines.append(f"environment: none at {e.venv}")
+            return lines
+        try:
+            probe = self.probeEnvironment()
+            problem = environment.check_probe(probe, host)
+            lines.append(f"environment: {e.venv}: Python {probe['version']} runs as {probe['machine']}"
+                         + (f" - PROBLEM: {problem}" if problem else " - ok"))
+        except Exception as exc:
+            lines.append(f"environment: {e.venv}: its Python does not run: {exc}")
+        lines.append(f"haversack: {e.haversack} {'present' if e.haversack.is_file() else 'MISSING'}; "
+                     f"lnq-segmenter: {e.lnq_segmenter} {'present' if e.lnq_segmenter.is_file() else 'MISSING'}")
+        if verify and e.haversack.is_file():
+            try:
+                v = environment.parse_json_line(self._run(e.verify_command(), timeout=300).splitlines())
+                lines.append(f"torch {v['torch']} (cuda {v['cuda']}, mps {v['mps']}), haversack {v['haversack']}")
+                lines.append("haversack segment options: " + (
+                    "ok" if not self.missingSegmentOptions() else
+                    "MISSING " + ", ".join(self.missingSegmentOptions()) + " - its source is too old"))
+            except Exception as exc:
+                lines.append(f"torch/haversack import check failed: {exc}")
+        lines.append(f"sources: haversack = {self.haversackSource()}; lnq-segmenter = {self.lnqSource()}")
+        return lines
 
     def _run(self, command, timeout=120) -> str:
         """A short command in the haversack environment, its stdout returned."""
@@ -121,18 +166,20 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
 
     def listModels(self) -> list:
         """Every model the module offers, haversack's catalog first. A source that cannot be
-        listed is skipped with a warning rather than hiding the others."""
-        entries = []
+        listed is skipped rather than hiding the others; why is kept in ``listProblems``."""
+        entries, self.listProblems = [], []
         try:
             entries += catalog.haversack_entries(
                 catalog.parse_json_output(self._run(self.env.tasks_command())))
         except Exception as exc:
-            logging.warning(f"haversack tasks: {exc}")
+            self.listProblems.append(f"haversack's catalog could not be listed: {exc}")
         try:
             entries += catalog.lnq_entries(
                 catalog.parse_json_output(self._run(self.env.lnq_list_command())))
         except Exception as exc:
-            logging.warning(f"lnq-segmenter list: {exc}")
+            self.listProblems.append(f"the LNQ models could not be listed: {exc}")
+        for problem in self.listProblems:
+            logging.warning(problem)
         entries += catalog.extra_entries(self.extraManifest(), self.env.models)
         return entries
 
@@ -227,8 +274,13 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._installButton.toolTip = ("Create the haversack environment (Python 3.12, uv) and "
                                        "install haversack and lnq-segmenter into it; again to update.")
         self._installButton.connect("clicked()", self._onInstallClicked)
+        self._diagnoseButton = qt.QPushButton("Diagnose")
+        self._diagnoseButton.toolTip = ("Write what this setup is into the log below: Slicer's Python and "
+                                        "its architecture, uv, the environment's Python, torch and haversack.")
+        self._diagnoseButton.connect("clicked()", self._onDiagnoseClicked)
         row.addWidget(self._envStatus, 1)
         row.addWidget(self._installButton, 0)
+        row.addWidget(self._diagnoseButton, 0)
         form.addRow(row)
 
         advanced = ctk_collapsible("Advanced", collapsed=True)
@@ -295,8 +347,14 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
 
     def _buildRunSection(self):
         box = qt.QWidget()
-        row = qt.QHBoxLayout(box)
-        row.setContentsMargins(0, 0, 0, 0)
+        col = qt.QVBoxLayout(box)
+        col.setContentsMargins(0, 0, 0, 0)
+        row = qt.QHBoxLayout()
+        col.addLayout(row)
+        self._runHint = qt.QLabel("")
+        self._runHint.wordWrap = True
+        self._runHint.setStyleSheet("color: gray;")
+        col.addWidget(self._runHint)
         self._runButton = qt.QPushButton("Segment")
         self._runButton.setDefault(True)
         self._runButton.connect("clicked()", self._onRunClicked)
@@ -328,7 +386,12 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
     def _refreshEnvironmentState(self):
         env = self.logic.env
         if not env.installed():
-            self._envStatus.text = f"Not installed. Install creates {env.venv} (about 2 GB with torch)."
+            if env.python.exists():
+                self._envStatus.text = (f"{env.venv} exists, but haversack is not installed in it: the last "
+                                        "Install did not finish. Click Install again; Diagnose and the log "
+                                        "below say why it stopped.")
+            else:
+                self._envStatus.text = f"Not installed. Install creates {env.venv} (about 2 GB with torch)."
             self._installButton.text = "Install"
         else:
             try:
@@ -347,6 +410,8 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
     def _populateModels(self):
         self._entries = self.logic.listModels() if self.logic.env.installed() else \
             catalog.extra_entries(self.logic.extraManifest(), self.logic.env.models)
+        for problem in getattr(self.logic, "listProblems", []) if self.logic.env.installed() else []:
+            self._log(problem)
         selected = self._selectedEntry()
         self._modelTree.clear()
         groups = {}
@@ -392,9 +457,14 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
     def _refreshRunButton(self):
         busy = self._runner is not None and (self._runner.isRunning() or bool(self._steps))
         e = self._selectedEntry()
-        self._runButton.enabled = (not busy and self.logic.env.installed() and e is not None
-                                   and self._inputSelector.currentNode() is not None)
+        why = ("running…" if busy else
+               "Segment needs the environment: click Install under Setup." if not self.logic.env.installed() else
+               "Choose a model in the list above." if e is None else
+               "Choose an input volume." if self._inputSelector.currentNode() is None else "")
+        self._runButton.enabled = not why
+        self._runHint.text = "" if busy else why
         self._installButton.enabled = not busy
+        self._diagnoseButton.enabled = not busy
         self._cancelButton.enabled = busy
 
     def _onSettingEdited(self, key, edit):
@@ -403,18 +473,62 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
 
     # ----- actions -----
 
+    def _onDiagnoseClicked(self):
+        self._status("Diagnosing (checks torch and haversack, which takes a few seconds)…")
+        slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+        try:
+            for line in self.logic.diagnostics(verify=True):
+                self._log("  " + line)
+        finally:
+            slicer.app.restoreOverrideCursor()
+        self._status("Diagnosis above.")
+
     def _onInstallClicked(self):
         self._logView.clear()
-        self._status("Installing uv into Slicer…")
+        env = self.logic.env
+        host = environment.host_info()
+        self._status("Installing uv into Slicer's Python…")
         try:
-            commands = self.logic.installCommands()
+            uv = self.logic.uvBinary()
         except Exception as exc:
             logging.exception("uv install failed")
-            slicer.util.errorDisplay(f"Could not install uv into Slicer's Python: {exc}")
+            self._status(f"Could not install uv into Slicer's Python: {exc}")
             return
-        self._steps = [("Creating the environment", commands[0], True, None),
-                       ("Installing haversack and lnq-segmenter (a few minutes the first time)",
-                        commands[1], True, None)]
+        for line in self.logic.diagnostics():
+            self._log("  " + line)
+        # --allow-existing keeps an environment as it is, so one built for the wrong architecture
+        # (an x86_64 Python on Apple Silicon, from a Slicer under Rosetta) is removed first
+        if env.python.exists():
+            try:
+                problem = environment.check_probe(self.logic.probeEnvironment(), host)
+            except Exception as exc:
+                problem = f"its Python does not run ({exc})"
+            if problem:
+                self._log(f"Removing {env.venv}: {problem}")
+                self.logic.removeEnvironment()
+
+        def checkPython():
+            probe = environment.parse_json_line(self._runner.stdoutLines)
+            self._log(f"  environment Python {probe['version']} runs as {probe['machine']}")
+            problem = environment.check_probe(probe, host)
+            if problem:
+                raise RuntimeError(problem)
+
+        def checkInstall():
+            v = environment.parse_json_line(self._runner.stdoutLines)
+            self._log(f"  torch {v['torch']} (cuda {v['cuda']}, mps {v['mps']}), haversack {v['haversack']}, "
+                      f"running as {v['machine']}")
+            if environment.expected_machine(host) == "arm64" and not v["mps"]:
+                self._log("  note: torch does not see the Apple GPU (MPS); segmentation will use the CPU")
+
+        self._steps = [
+            (f"Creating the environment (Python {environment.python_request(host)})",
+             env.create_command(uv, host), True, None),
+            ("Checking the environment's Python", env.probe_command(), True, checkPython),
+            ("Installing haversack and lnq-segmenter (several minutes and about 2 GB the first time)",
+             env.install_command(uv, self.logic.haversackSource(), self.logic.lnqSource()), True, None),
+            ("Checking torch and haversack", env.verify_command(), True, checkInstall),
+        ]
         self._onAllDone = self._refreshEnvironmentState
         self._runNext()
 
@@ -525,7 +639,7 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
             return
         label, _command, _clean, onOk = self._steps.pop(0)
         if status != "ok":
-            self._stopRun(f"{label} {status} (exit {code}); see the log below.")
+            self._stopRun(f"{label} {status} (exit {code}){self._lastError()}; the log below has the rest.")
             return
         try:
             if onOk:
@@ -595,7 +709,16 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._log(text)
 
     def _log(self, line):
+        self._recent = (getattr(self, "_recent", []) + [str(line)])[-40:]
         self._logView.appendPlainText(line)
+
+    def _lastError(self) -> str:
+        """The failed command's most telling line, for the status: uv's and haversack's errors."""
+        for line in reversed(getattr(self, "_recent", [])):
+            low = line.lower()
+            if low.startswith(("error", "haversack error", "×", "  ×")) or "error:" in low or "no solution" in low:
+                return ": " + line.strip()[:300]
+        return ""
 
     def cleanup(self):
         if self._runner is not None and self._runner.isRunning():

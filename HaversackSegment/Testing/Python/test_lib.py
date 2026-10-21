@@ -128,6 +128,38 @@ class TestEnvironment:
         cmd = e.install_command("uv", haversack="-e ~/src/haversack")
         assert "-e" in cmd and str(Path("~/src/haversack").expanduser()) in cmd
 
+    def test_apple_silicon_gets_an_arm64_python_whatever_slicer_runs_as(self, tmp_path):
+        """A Slicer under Rosetta reports x86_64; the environment must still be arm64 (torch has no
+        x86_64 macOS wheels), so the Python is requested by architecture."""
+        mac = {"system": "Darwin", "process_machine": "x86_64", "hardware_arm64": True, "translated": True}
+        intel = {"system": "Darwin", "process_machine": "x86_64", "hardware_arm64": False}
+        linux = {"system": "Linux", "process_machine": "x86_64", "hardware_arm64": False}
+        assert environment.python_request(mac) == "cpython-3.12-macos-aarch64-none"
+        assert environment.python_request(intel) == environment.python_request(linux) == "3.12"
+        cmd = environment.Environment.at(tmp_path).create_command("uv", mac)
+        assert cmd[:4] == ["uv", "venv", "--allow-existing", "--managed-python"]
+        assert cmd[-2] == "cpython-3.12-macos-aarch64-none"
+        assert "Apple Silicon" in environment.check_probe({"machine": "x86_64", "version": "3.12.11"}, mac)
+        assert environment.check_probe({"machine": "arm64", "version": "3.12.11"}, mac) is None
+        assert environment.check_probe({"machine": "x86_64", "version": "3.12.3"}, linux) is None
+        assert "3.12" in environment.check_probe({"machine": "x86_64", "version": "3.9.6"}, linux)
+
+    def test_binary_arch_reads_headers(self, tmp_path):
+        cases = {"arm64": b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01", "x86_64": b"\xcf\xfa\xed\xfe\x07\x00\x00\x01",
+                 "universal": b"\xca\xfe\xba\xbe\x00\x00\x00\x02", "ELF": b"\x7fELF\x02\x01\x01\x00",
+                 "script": b"#!/bin/sh\n"}
+        for want, head in cases.items():
+            (tmp_path / want).write_bytes(head)
+            assert environment.binary_arch(tmp_path / want) == want
+        assert environment.binary_arch(tmp_path / "nope") == "missing"
+
+    def test_probe_and_verify_print_one_json_line(self):
+        out = subprocess.run([sys.executable, "-c", environment.PROBE_CODE], capture_output=True, text=True)
+        probe = environment.parse_json_line(["noise", out.stdout.strip()])
+        assert set(probe) == {"machine", "version", "executable"}
+        with pytest.raises(ValueError):
+            environment.parse_json_line(["no json here"])
+
     def test_an_old_haversack_is_reported(self):
         assert environment.missing_segment_options("--task --device") == ["--json-progress", "--folds"]
         assert environment.missing_segment_options("--json-progress --folds") == []
