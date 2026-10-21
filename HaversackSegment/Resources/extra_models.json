@@ -1,0 +1,37 @@
+{
+  "schema": "slicer-haversack-extra-models/1",
+  "models": [
+    {
+      "id": "pants-regions",
+      "display_name": "PanTS pancreas + 27 structures (nnU-Net, regions)",
+      "description": "Pancreatic lesion, pancreas head/body/tail/duct and 24 surrounding abdominal structures on CT. nnU-Net v2 ResEnc-M, region-based (sigmoid) heads, trained on the PanTS dataset (9,000 CTs); the nnU-Net baseline on the PanTS leaderboard.",
+      "modality": "CT",
+      "source": {
+        "kind": "huggingface",
+        "repo": "edomerli/nnUNet-PanTS-regions",
+        "revision": "2f3e1b57f194d658d884ee9fd451b0af05255d64",
+        "url": "https://huggingface.co/edomerli/nnUNet-PanTS-regions"
+      },
+      "dataset_dir": "Dataset003_PanTS_regions",
+      "model_dir": "nnUNetTrainer_onlyMirror01_PanCrop__nnUNetResEncUNetMPlansIso1x1x1__3d_fullres",
+      "files": [
+        {"path": "dataset.json", "sha256": "ae5d5f3f4f8b4de41f37ff8fe35149ff2b783b25e2d41b57f01e6b3320113104", "size": 1665},
+        {"path": "plans.json", "sha256": "291a0aaeeea0d2cda6efc642678812c99697dcbda1f712d80bd3e5dcc3eab5c1", "size": 16091},
+        {"path": "fold_all/checkpoint_best.pth", "sha256": "5942250f871c1f39ce28fdc76822e7308063a9ff2c2223558c8dc01cd996f49c", "size": 817925583}
+      ],
+      "haversack_args": [],
+      "segment_renames": {"pancreas": "pancreas_other"},
+      "license": {
+        "id": "pants-regions@2f3e1b5:MIT-weights+CC-BY-NC-ND-4.0-data",
+        "summary": "Weights: MIT, as stated on the model card. Training data: the PanTS dataset, CC BY-NC-ND 4.0 (Johns Hopkins University).",
+        "terms": "These model weights were published on Hugging Face by Edoardo Merli under the MIT license. They were trained on the PanTS dataset (Johns Hopkins University), which is licensed CC BY-NC-ND 4.0: attribution required, non-commercial use only, no derivatives. Whether the dataset's terms bind models trained on it is not settled; treat these weights as for non-commercial research use unless you have confirmed otherwise with the dataset's authors. They are not for clinical or diagnostic use.\n\nBy accepting you confirm that you have read the model card and the PanTS license, and that your use complies with both.",
+        "links": [
+          {"title": "Model card (MIT)", "url": "https://huggingface.co/edomerli/nnUNet-PanTS-regions"},
+          {"title": "PanTS dataset license (CC BY-NC-ND 4.0)", "url": "https://github.com/MrGiovanni/PanTS/blob/main/LICENSE"},
+          {"title": "PanTS", "url": "https://github.com/MrGiovanni/PanTS"}
+        ],
+        "citation": "Li W, Zhou X, Chen Q, et al. PanTS: The Pancreatic Tumor Segmentation Dataset. NeurIPS 2025 Datasets and Benchmarks Track. https://github.com/MrGiovanni/PanTS"
+      }
+    }
+  ]
+}
