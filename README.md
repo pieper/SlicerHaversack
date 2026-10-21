@@ -41,6 +41,8 @@ Windows. Intel Macs can't run it, because current torch publishes no wheels for 
 ## Try it on an Apple Silicon Mac
 
 1. **Get Slicer and the module.**
+   - You need macOS 14 (Sonoma) or later: the oldest the current torch publishes Apple
+     Silicon wheels for.
    - Install a current [3D Slicer](https://download.slicer.org) (5.10 or later) for macOS
      arm64.
    - `git clone https://github.com/pieper/SlicerHaversack`.
