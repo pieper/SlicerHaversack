@@ -5,9 +5,10 @@ A 3D Slicer extension with one module, **Haversack Segment**, that runs
 
 - **haversack's catalog**: TotalSegmentator (v2, v3), MOOSE, MRSegmentator, DentalSegmentator,
   TotalVibeSegmentator, CADS, FastSurfer, SynthStrip. Weights download on first use.
-- **LNQ lymph-node models** ([lnq-segmenter](https://github.com/pieper/lnq-segmenter)).
-  lnq-segmenter downloads and verifies the bundle, and haversack runs every fold the registry
-  names.
+- **LNQ lymph-node models**: haversack's `lnq:*` tasks (haversack 0.16.0), listed in a group of
+  their own. haversack downloads them from the
+  [lnq-segmenter](https://github.com/pieper/lnq-segmenter) releases and runs each model's full
+  fold ensemble.
 - **Extra models that need a license accepted**, listed in
   `HaversackSegment/Resources/extra_models.json`. They are kept out of haversack's catalog on
   purpose. The first one is the PanTS nnU-Net (pancreatic lesion, pancreas head/body/tail/duct
@@ -17,8 +18,8 @@ A 3D Slicer extension with one module, **Haversack Segment**, that runs
 
 Inference doesn't run in Slicer's Python. haversack needs Python 3.12–3.14 and installs only
 with uv, so the module keeps its own environment at `~/.slicer-haversack/env`. **Install**
-pip-installs `uv` into Slicer, creates the environment with uv's Python 3.12, and installs
-haversack and lnq-segmenter into it. `--torch-backend auto` picks the right torch build for a
+pip-installs `uv` into Slicer, creates the environment with uv's Python 3.12 (the arm64 build on
+an Apple Silicon Mac, even when Slicer itself runs under Rosetta), and installs haversack into it. `--torch-backend auto` picks the right torch build for a
 CUDA card. A run is three steps:
 
 1. The selected volume is saved to `~/.slicer-haversack/work/run-*/input.nrrd`.
@@ -27,8 +28,7 @@ CUDA card. A run is three steps:
    the process.
 3. `labels.seg.nrrd` is loaded as a segmentation on the volume's geometry.
 
-For an LNQ model, `lnq-segmenter download` runs first. For an extra model,
-`fetch_model.py` runs first.
+For an extra model, `fetch_model.py` downloads the weights first.
 
 A license is accepted once per model and revision, in a dialog that shows its terms, links and
 citation. `fetch_model.py` downloads nothing unless the exact license id is passed. It records
@@ -58,6 +58,9 @@ Windows. Intel Macs can't run it, because current torch publishes no wheels for 
      its license first).
    - Set *Device* to `mps` (or leave it on `auto`) and click **Segment**.
 5. **Troubleshooting.**
+   - **Install or Segment doesn't work.** Click **Diagnose** under *Setup*. It writes the setup
+     into the log: Slicer's Python and its architecture, uv, the environment's Python, torch and
+     whether it sees the GPU. A line under **Segment** says why it is disabled.
    - **Install fails with "Application is NOT executable … python-real".** macOS has
      quarantined the Slicer bundle, so Slicer's own Python launcher refuses to start, and
      `pip_install` goes through that launcher. Clear the flag and retry:
@@ -65,9 +68,10 @@ Windows. Intel Macs can't run it, because current torch publishes no wheels for 
    - **Slicer hangs at startup on a "reopen windows?" alert after a crash.** Launch it once
      with `-ApplePersistenceIgnoreState YES`.
 
-Until [mhalle/haversack#4](https://github.com/mhalle/haversack/pull/4) is merged, Install takes
-haversack from `pieper/haversack@region-models`. That branch adds region-based models (PanTS),
-`--folds` and `--json-progress`. Set *Advanced → haversack* to use another source.
+Until [mhalle/haversack#5](https://github.com/mhalle/haversack/pull/5) (`--folds`,
+`--json-progress`) and [#6](https://github.com/mhalle/haversack/pull/6) (region-based models such
+as PanTS) are merged, Install takes haversack from `pieper/haversack@slicerhaversack`: haversack
+0.16.0 with both. Set *Advanced → haversack* to use another source.
 
 ## Settings (Setup → Advanced)
 
@@ -76,7 +80,6 @@ haversack from `pieper/haversack@region-models`. That branch adds region-based m
   git+https://github.com/mhalle/haversack@<branch>`) or a local checkout path, which is
   installed editable. The module needs `haversack segment --json-progress` and `--folds`. If
   the installed haversack lacks them, Setup says so.
-- **lnq-segmenter**: the same, for lnq-segmenter.
 
 ## Tests
 

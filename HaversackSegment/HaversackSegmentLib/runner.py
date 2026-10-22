@@ -3,8 +3,8 @@
 Adapted from SlicerLNQ's LymphNodeQuantifierLib/runner.py: pure Qt, no Python ``subprocess`` and
 no threads - the QProcess plugs into Slicer's event loop, so output arrives on the GUI thread, and
 cancel is QProcess.kill (SIGKILL on POSIX, TerminateProcess on Windows). Generalized to any
-program and any set of event prefixes: haversack writes ``haversack> {json}``, lnq-segmenter
-``lnq> {json}``, fetch_model ``fetch> {json}``, all on stderr.
+program and any set of event prefixes: haversack writes ``haversack> {json}`` and fetch_model
+``fetch> {json}``, both on stderr.
 
 A program from the haversack environment must not see Slicer's own Python settings
 (``PYTHONHOME``, ``PYTHONPATH``, which the Slicer launcher sets for PythonSlicer): its interpreter
@@ -18,7 +18,7 @@ import json
 import qt
 import slicer
 
-PREFIXES = ("haversack> ", "lnq> ", "fetch> ")
+PREFIXES = ("haversack> ", "fetch> ")
 
 
 class CommandRunner(qt.QObject):

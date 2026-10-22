@@ -122,11 +122,12 @@ class TestEnvironment:
 
     def test_install_command_takes_a_local_checkout_as_editable(self, tmp_path):
         e = environment.Environment.at(tmp_path / "home")
-        cmd = e.install_command("uv", haversack=str(tmp_path), lnq="lnq-segmenter @ git+https://x/y")
+        cmd = e.install_command("uv", haversack=str(tmp_path))
         assert cmd[:2] == ["uv", "pip"] and "--torch-backend" in cmd
-        assert cmd[-3:] == ["-e", str(tmp_path), "lnq-segmenter @ git+https://x/y"]
+        assert cmd[-2:] == ["-e", str(tmp_path)]
         cmd = e.install_command("uv", haversack="-e ~/src/haversack")
-        assert "-e" in cmd and str(Path("~/src/haversack").expanduser()) in cmd
+        assert cmd[-2:] == ["-e", str(Path("~/src/haversack").expanduser())]
+        assert e.install_command("uv")[-1] == environment.DEFAULT_HAVERSACK
 
     def test_apple_silicon_gets_an_arm64_python_whatever_slicer_runs_as(self, tmp_path):
         """A Slicer under Rosetta reports x86_64; the environment must still be arm64 (torch has no
@@ -166,69 +167,24 @@ class TestEnvironment:
 
 
 TASKS = [{"name": "ts.v2:total_fast", "engine": "nnunetv2", "modality": "CT", "installed": True,
-          "license": "Apache-2.0", "description": "117 structures, 3 mm"}]
-LNQ = [{"name": "inguinal-v1", "version": "1.0.0", "display_name": "LNQ-inguinal v1",
-        "modality": "CT", "folds": [0, 1, 2, 3], "license": "CC BY 4.0",
-        "plans_subdir": "nnUNetTrainer__nnUNetResEncUNetMPlans__3d_fullres"}]
+          "license": "Apache-2.0", "description": "117 structures, 3 mm"},
+         {"name": "lnq:abdominopelvic-v1", "engine": "nnunetv2", "modality": "CT", "installed": False,
+          "license": "CC-BY-4.0", "description": "abdominopelvic lymph nodes"}]
 
 
 class TestCatalog:
     def test_entries_share_one_shape(self, tmp_path):
-        entries = (catalog.haversack_entries(TASKS) + catalog.lnq_entries(LNQ, cached=lambda m: False)
-                   + catalog.extra_entries(fetch_model.load_manifest(), tmp_path))
-        assert [e["kind"] for e in entries] == ["haversack", "lnq", "extra"]
+        entries = catalog.haversack_entries(TASKS) + catalog.extra_entries(fetch_model.load_manifest(), tmp_path)
+        assert [e["kind"] for e in entries] == ["haversack", "haversack", "extra"]
         for e in entries:
             assert set(e) == {"key", "kind", "group", "title", "description", "modality", "license",
                               "installed", "data"}
         assert entries[0]["key"] == "haversack:ts.v2:total_fast"
-        assert entries[1]["key"] == "lnq:inguinal-v1@1.0.0"
 
-    def test_lnq_runs_the_folds_it_was_released_with(self):
-        assert catalog.lnq_folds(LNQ[0]) == "0,1,2,3"
-        assert catalog.lnq_folds({}) == "all"
-
-    def test_an_lnq_bundle_becomes_a_model_folder(self, tmp_path):
-        bundle = tmp_path / "inguinal-v1-1.0.0"
-        folder = bundle / LNQ[0]["plans_subdir"]
-        (folder / "fold_0").mkdir(parents=True)
-        (bundle / "dataset.json").write_text("{}")
-        (bundle / "plans.json").write_text("{}")
-        assert catalog.prepare_lnq_bundle(bundle, LNQ[0]) == folder
-        assert (folder / "dataset.json").is_file() and (folder / "plans.json").is_file()
-
-    def test_a_bundle_named_after_its_model_gets_a_stock_named_folder(self, tmp_path):
-        """abdominopelvic-v1's layout: the folds in `abdominopelvic-v1/`, trainer and configuration
-        left blank in the registry, so they come from the checkpoint."""
-        m = {"name": "abdominopelvic-v1", "plans_subdir": "abdominopelvic-v1", "folds": [0, 1],
-             "trainer_class": "", "plans_identifier": "", "configuration": ""}
-        (tmp_path / "abdominopelvic-v1" / "fold_0").mkdir(parents=True)
-        (tmp_path / "abdominopelvic-v1" / "fold_0" / "checkpoint_final.pth").write_text("x")
-        (tmp_path / "dataset.json").write_text("{}")
-        (tmp_path / "plans.json").write_text('{"plans_name": "nnUNetResEncUNetMPlans"}')
-        assert catalog.needs_checkpoint_meta(m)
-        assert catalog.first_checkpoint(tmp_path, m).name == "checkpoint_final.pth"
-        with pytest.raises(ValueError, match="cannot name"):
-            catalog.prepare_lnq_bundle(tmp_path, m)
-        got = catalog.prepare_lnq_bundle(tmp_path, m, {"trainer": "nnUNetTrainer", "configuration": "3d_fullres"})
-        assert got.name == "nnUNetTrainer__nnUNetResEncUNetMPlans__3d_fullres"
-        assert (got / "fold_0" / "checkpoint_final.pth").is_file() and (got / "dataset.json").is_file()
-        assert not catalog.needs_checkpoint_meta(LNQ[0])
-
-    def test_an_incomplete_bundle_is_refused(self, tmp_path):
-        (tmp_path / LNQ[0]["plans_subdir"]).mkdir()
-        with pytest.raises(FileNotFoundError, match="dataset.json"):
-            catalog.prepare_lnq_bundle(tmp_path, LNQ[0])
-
-    def test_lnq_cache_is_read_by_lnq_segmenters_rule(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("LNQ_SEGMENTER_CACHE", str(tmp_path))
-        m = LNQ[0]
-        assert not catalog.lnq_cached(m)
-        root = tmp_path / "inguinal-v1-1.0.0"
-        for f in ["dataset.json", "plans.json"] + [f"{m['plans_subdir']}/fold_{i}/checkpoint_final.pth"
-                                                   for i in m["folds"]]:
-            (root / f).parent.mkdir(parents=True, exist_ok=True)
-            (root / f).write_text("x")
-        assert catalog.lnq_cached(m)
+    def test_lnq_catalog_tasks_get_their_own_group(self):
+        groups = {e["title"]: e["group"] for e in catalog.haversack_entries(TASKS)}
+        assert groups == {"ts.v2:total_fast": catalog.GROUPS["haversack"],
+                          "lnq:abdominopelvic-v1": catalog.GROUPS["lnq"]}
 
     def test_json_output_after_log_lines(self):
         assert catalog.parse_json_output("warning: x\n[1, 2]\n") == [1, 2]

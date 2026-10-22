@@ -3,9 +3,9 @@
 haversack needs Python 3.12-3.14 and installs only with uv (several of its dependencies come
 from git tags, which uv resolves and pip does not), so it cannot go into Slicer's site-packages.
 The module keeps one virtual environment under its home directory instead, built with a uv that
-pip installs into Slicer (a single binary wheel), and runs everything there as a subprocess:
-haversack for inference, lnq-segmenter for the LNQ models' downloads. The environment brings
-its own interpreter, so it works with a Slicer whose Python is older than haversack allows.
+pip installs into Slicer (a single binary wheel), and runs haversack there as a subprocess. The
+environment brings its own interpreter, so it works with a Slicer whose Python is older than
+haversack allows.
 
 No Slicer imports here: the paths and command lines are plain data, testable outside Slicer.
 """
@@ -21,10 +21,10 @@ from pathlib import Path
 
 PYTHON_VERSION = "3.12"
 DEFAULT_HOME = Path("~/.slicer-haversack")
-# Region-based models (PanTS), --folds and --json-progress are in mhalle/haversack#4; until it is
-# merged the default installs that branch from Steve's fork. Then: mhalle/haversack, main.
-DEFAULT_HAVERSACK = "haversack @ git+https://github.com/pieper/haversack@region-models"
-DEFAULT_LNQ = "lnq-segmenter @ git+https://github.com/pieper/lnq-segmenter"
+# haversack 0.16.0 plus --folds/--json-progress (mhalle/haversack#5) and region-based models such
+# as PanTS (mhalle/haversack#6). Until both are merged the default installs the branch on Steve's
+# fork that carries them; then: mhalle/haversack, main.
+DEFAULT_HAVERSACK = "haversack @ git+https://github.com/pieper/haversack@slicerhaversack"
 # What this module needs from `haversack segment`; an older install lacks it and is reported as
 # out of date rather than failing a run halfway.
 REQUIRED_SEGMENT_OPTIONS = ("--json-progress", "--folds")
@@ -67,12 +67,8 @@ class Environment:
     def haversack(self) -> Path:
         return self._bin("haversack")
 
-    @property
-    def lnq_segmenter(self) -> Path:
-        return self._bin("lnq-segmenter")
-
     def installed(self) -> bool:
-        return self.haversack.is_file() and self.lnq_segmenter.is_file()
+        return self.haversack.is_file()
 
     # -- install -------------------------------------------------------------------------------
 
@@ -90,15 +86,11 @@ class Environment:
         """After an install: torch, its GPU, and haversack import (one JSON line)."""
         return [str(self.python), "-c", VERIFY_CODE]
 
-    def install_command(self, uv: str, haversack: str = DEFAULT_HAVERSACK,
-                        lnq: str = DEFAULT_LNQ) -> list[str]:
-        """Install or update both CLIs. ``--torch-backend auto`` has uv pick the torch build for
+    def install_command(self, uv: str, haversack: str = DEFAULT_HAVERSACK) -> list[str]:
+        """Install or update haversack. ``--torch-backend auto`` has uv pick the torch build for
         the machine's GPU (CUDA on Windows needs it; PyPI's Windows torch is CPU-only)."""
-        cmd = [uv, "pip", "install", "--python", str(self.python), "--upgrade",
-               "--torch-backend", "auto"]
-        for spec in (haversack, lnq):
-            cmd += _spec_args(spec)
-        return cmd
+        return [uv, "pip", "install", "--python", str(self.python), "--upgrade",
+                "--torch-backend", "auto", *_spec_args(haversack)]
 
     # -- run -----------------------------------------------------------------------------------
 
@@ -107,13 +99,6 @@ class Environment:
 
     def segment_help_command(self) -> list[str]:
         return [str(self.haversack), "segment", "--help"]
-
-    def lnq_list_command(self) -> list[str]:
-        return [str(self.lnq_segmenter), "list", "--json"]
-
-    def lnq_download_command(self, name: str, version: str | None = None) -> list[str]:
-        spec = f"{name}@{version}" if version else name
-        return [str(self.lnq_segmenter), "download", spec, "--json-progress"]
 
     def segment_command(self, input_path, task, output_path, *, device="auto", folds=None,
                         extra=()) -> list[str]:

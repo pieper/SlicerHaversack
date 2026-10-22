@@ -1,9 +1,8 @@
 """Haversack Segment - run haversack's segmentation models on a volume in the scene.
 
 One module for every model haversack runs: its own catalog (TotalSegmentator, MOOSE,
-MRSegmentator, CADS, ...), the LNQ lymph-node models (downloaded by lnq-segmenter, run by
-haversack), and extra models whose license the user accepts before the weights are fetched
-(PanTS). Inference runs as a subprocess - `haversack segment ... --json-progress` - in an
+MRSegmentator, CADS, the LNQ lymph-node models, ...), and extra models whose license the user
+accepts before the weights are fetched (PanTS). Inference runs as a subprocess - `haversack segment ... --json-progress` - in an
 environment the module keeps apart from Slicer's Python (HaversackSegmentLib.environment), with
 progress streamed into the panel and a cancel that kills the process.
 """
@@ -11,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 import sys
@@ -82,9 +80,6 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
     def haversackSource(self) -> str:
         return self.setting("HaversackSource", environment.DEFAULT_HAVERSACK)
 
-    def lnqSource(self) -> str:
-        return self.setting("LNQSource", environment.DEFAULT_LNQ)
-
     # ----- environment -----
 
     @staticmethod
@@ -133,8 +128,7 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
                          + (f" - PROBLEM: {problem}" if problem else " - ok"))
         except Exception as exc:
             lines.append(f"environment: {e.venv}: its Python does not run: {exc}")
-        lines.append(f"haversack: {e.haversack} {'present' if e.haversack.is_file() else 'MISSING'}; "
-                     f"lnq-segmenter: {e.lnq_segmenter} {'present' if e.lnq_segmenter.is_file() else 'MISSING'}")
+        lines.append(f"haversack: {e.haversack} {'present' if e.haversack.is_file() else 'MISSING'}")
         if verify and e.haversack.is_file():
             try:
                 v = environment.parse_json_line(self._run(e.verify_command(), timeout=300).splitlines())
@@ -144,7 +138,7 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
                     "MISSING " + ", ".join(self.missingSegmentOptions()) + " - its source is too old"))
             except Exception as exc:
                 lines.append(f"torch/haversack import check failed: {exc}")
-        lines.append(f"sources: haversack = {self.haversackSource()}; lnq-segmenter = {self.lnqSource()}")
+        lines.append(f"haversack source: {self.haversackSource()}")
         return lines
 
     def _run(self, command, timeout=120) -> str:
@@ -173,11 +167,6 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
                 catalog.parse_json_output(self._run(self.env.tasks_command())))
         except Exception as exc:
             self.listProblems.append(f"haversack's catalog could not be listed: {exc}")
-        try:
-            entries += catalog.lnq_entries(
-                catalog.parse_json_output(self._run(self.env.lnq_list_command())))
-        except Exception as exc:
-            self.listProblems.append(f"the LNQ models could not be listed: {exc}")
         for problem in self.listProblems:
             logging.warning(problem)
         entries += catalog.extra_entries(self.extraManifest(), self.env.models)
@@ -199,8 +188,7 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
     @staticmethod
     def loadResult(path, entry: dict, volumeNode):
         """Load a haversack ``.seg.nrrd`` as a segmentation on ``volumeNode``'s geometry, with
-        the entry's renames (PanTS's leftover ``pancreas`` is ``pancreas_other``) and, for an
-        LNQ model, the registry's segment name, color and terminology."""
+        the entry's renames (PanTS's leftover ``pancreas`` is ``pancreas_other``)."""
         seg = slicer.util.loadSegmentation(str(path))
         if seg is None:
             raise RuntimeError(f"failed to load segmentation from {path}")
@@ -212,17 +200,6 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
             segment = segmentation.GetNthSegment(i)
             if segment.GetName() in renames:
                 segment.SetName(renames[segment.GetName()])
-        if entry["kind"] == "lnq" and segmentation.GetNumberOfSegments() == 1:
-            m = entry["data"]
-            segment = segmentation.GetNthSegment(0)
-            if m.get("segment_name"):
-                segment.SetName(m["segment_name"])
-            if m.get("color"):
-                segment.SetColor(*[c / 255.0 for c in m["color"][:3]])
-            if m.get("snomed_code"):
-                segment.SetTag("SNOMED-CT.code", m["snomed_code"])
-            if m.get("snomed_term"):
-                segment.SetTag("SNOMED-CT.term", m["snomed_term"])
         seg.SetAttribute("Haversack.model", entry["key"])
         return seg
 
@@ -272,7 +249,7 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._envStatus.wordWrap = True
         self._installButton = qt.QPushButton("Install")
         self._installButton.toolTip = ("Create the haversack environment (Python 3.12, uv) and "
-                                       "install haversack and lnq-segmenter into it; again to update.")
+                                       "install haversack into it; again to update.")
         self._installButton.connect("clicked()", self._onInstallClicked)
         self._diagnoseButton = qt.QPushButton("Diagnose")
         self._diagnoseButton.toolTip = ("Write what this setup is into the log below: Slicer's Python and "
@@ -290,13 +267,10 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._haversackEdit = qt.QLineEdit(self.logic.haversackSource())
         self._haversackEdit.toolTip = ("What `uv pip install` installs for haversack: a requirement "
                                        "(git URL, @branch) or a local checkout path (installed editable).")
-        self._lnqEdit = qt.QLineEdit(self.logic.lnqSource())
-        for edit, key in ((self._homeEdit, "Home"), (self._haversackEdit, "HaversackSource"),
-                          (self._lnqEdit, "LNQSource")):
+        for edit, key in ((self._homeEdit, "Home"), (self._haversackEdit, "HaversackSource")):
             edit.connect("editingFinished()", lambda e=edit, k=key: self._onSettingEdited(k, e))
         aform.addRow("Home:", self._homeEdit)
         aform.addRow("haversack:", self._haversackEdit)
-        aform.addRow("lnq-segmenter:", self._lnqEdit)
         form.addRow(advanced)
         return box
 
@@ -525,8 +499,8 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
             (f"Creating the environment (Python {environment.python_request(host)})",
              env.create_command(uv, host), True, None),
             ("Checking the environment's Python", env.probe_command(), True, checkPython),
-            ("Installing haversack and lnq-segmenter (several minutes and about 2 GB the first time)",
-             env.install_command(uv, self.logic.haversackSource(), self.logic.lnqSource()), True, None),
+            ("Installing haversack (several minutes and about 2 GB the first time)",
+             env.install_command(uv, self.logic.haversackSource()), True, None),
             ("Checking torch and haversack", env.verify_command(), True, checkInstall),
         ]
         self._onAllDone = self._refreshEnvironmentState
@@ -552,23 +526,9 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         extra = ["--allow-transpose"] if self._transposeCheck.checked else []
         device = self._deviceCombo.currentText
         steps = []
-        folds = None
+        folds = None              # a catalog task runs the ensemble its catalog states (lnq:*)
         if e["kind"] == "haversack":
             self._task = e["data"]["name"]
-        elif e["kind"] == "lnq":
-            m = e["data"]
-            folds = catalog.lnq_folds(m)
-
-            def bundleReady():
-                bundle = catalog.last_path(self._runner.stdoutLines)
-                meta = None
-                if catalog.needs_checkpoint_meta(m):
-                    self._status("Reading the model's trainer and configuration from its checkpoint…")
-                    meta = json.loads(self.logic._run([env.python, "-c", catalog.CHECKPOINT_META_CODE,
-                                                       catalog.first_checkpoint(bundle, m)]).strip().splitlines()[-1])
-                self._task = catalog.prepare_lnq_bundle(bundle, m, meta)
-            steps.append((f"Fetching {m['name']}@{m['version']} (lnq-segmenter)",
-                          env.lnq_download_command(m["name"], m["version"]), True, bundleReady))
         else:
             m = e["data"]
             if not fetch_model.is_installed(m, env.models):
@@ -739,8 +699,8 @@ def ctk_collapsible(title, collapsed=False):
 # =============================================================================
 
 class HaversackSegmentTest(ScriptedLoadableModuleTest):
-    """Runs without the haversack environment: the catalog of extra models, the license gate, the
-    LNQ bundle layout, and the runner's event parsing against a stand-in command."""
+    """Runs without the haversack environment: the catalog of extra models, the license gate, and
+    the runner's event parsing against a stand-in command."""
 
     def setUp(self):
         slicer.mrmlScene.Clear()
@@ -770,7 +730,7 @@ class HaversackSegmentTest(ScriptedLoadableModuleTest):
         runner.progressEvent.connect(lambda t: events.append(json.loads(t)))
         runner.finished.connect(lambda c, s: finished.append((c, s)))
         # a shell, not PythonSlicer, as the stand-in: the test must not depend on the launcher
-        lines = ['haversack> {"event": "progress", "fraction": 0.5}', 'lnq> {"event": "download_done"}',
+        lines = ['haversack> {"event": "progress", "fraction": 0.5}', 'fetch> {"event": "done"}',
                  "plain line"]
         if sys.platform == "win32":
             script = "echo /some/folder& " + "& ".join(f"echo {l} 1>&2" for l in lines)
@@ -784,5 +744,5 @@ class HaversackSegmentTest(ScriptedLoadableModuleTest):
             time.sleep(0.02)
         self.assertEqual(finished, [(0, "ok")])
         self.assertEqual([(e["source"], e["event"]) for e in events],
-                         [("haversack", "progress"), ("lnq", "download_done")])
+                         [("haversack", "progress"), ("fetch", "done")])
         self.assertEqual(runner.stdoutLines, ["/some/folder"])
