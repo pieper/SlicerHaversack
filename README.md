@@ -19,8 +19,10 @@ A 3D Slicer extension with one module, **Haversack Segment**, that runs
 Inference doesn't run in Slicer's Python. haversack needs Python 3.12–3.14 and installs only
 with uv, so the module keeps its own environment at `~/.slicer-haversack/env`. **Install**
 pip-installs `uv` into Slicer, creates the environment with uv's Python 3.12 (the arm64 build on
-an Apple Silicon Mac, even when Slicer itself runs under Rosetta), and installs haversack into it. `--torch-backend auto` picks the right torch build for a
-CUDA card. A run is three steps:
+an Apple Silicon Mac, even when Slicer itself runs under Rosetta), and installs haversack into it.
+`--torch-backend auto` picks the right torch build for a CUDA card. uv keeps its downloads and the
+managed Python under the module's home (`uv-cache/`, `python/`), not in its shared cache, so
+**Uninstall…** can remove exactly what the module downloaded. A run is three steps:
 
 1. The selected volume is saved to `~/.slicer-haversack/work/run-*/input.nrrd`.
 2. `haversack segment input.nrrd --task <task> -o labels.seg.nrrd --json-progress` runs as a
@@ -29,6 +31,21 @@ CUDA card. A run is three steps:
 3. `labels.seg.nrrd` is loaded as a segmentation on the volume's geometry.
 
 For an extra model, `fetch_model.py` downloads the weights first.
+
+Slicer stays usable throughout. Every install, download and segmentation step is a background
+process, and so are the model listing and the version check. Diagnose and Uninstall run on a
+background thread.
+- **The status line** shows the step, its elapsed time, and a note when the step has printed
+  nothing for a while.
+- **The progress bar** follows what the step reports: uv's downloads (bytes finished of bytes
+  announced), haversack's per-patch progress, or a weights download's bytes. Until a step reports
+  a fraction, it shows as busy.
+- **Each step's output** goes to its own log under `~/.slicer-haversack/logs/`.
+- **How output reaches the panel:** each step ends with a line saying how its output arrived
+  (readyRead signals, the fallback check, files). Lines normally arrive through QProcess's
+  readyRead signals. If those go quiet for a second while the step runs, the module asks
+  QProcess to check the pipes. *Advanced → Output: file* sends output to files instead, read
+  four times a second.
 
 A license is accepted once per model and revision, in a dialog that shows its terms, links and
 citation. `fetch_model.py` downloads nothing unless the exact license id is passed. It records
@@ -58,6 +75,11 @@ Windows. Intel Macs can't run it, because current torch publishes no wheels for 
      its license first).
    - Set *Device* to `mps` (or leave it on `auto`) and click **Segment**.
 5. **Troubleshooting.**
+   - **Start over.** **Uninstall…** removes the environment only (a reinstall is quick), or the
+     environment and its downloads (a reinstall downloads everything again). Model weights are
+     kept either way.
+   - **Progress appears only when a step ends.** Look at the delivery line in the log. If it
+     says the lines came "at exit", switch *Advanced → Output* to `file`.
    - **Install or Segment doesn't work.** Click **Diagnose** under *Setup*. It writes the setup
      into the log: Slicer's Python and its architecture, uv, the environment's Python, torch and
      whether it sees the GPU. A line under **Segment** says why it is disabled.
@@ -73,9 +95,28 @@ Until [mhalle/haversack#5](https://github.com/mhalle/haversack/pull/5) (`--folds
 as PanTS) are merged, Install takes haversack from `pieper/haversack@slicerhaversack`: haversack
 0.16.0 with both. Set *Advanced → haversack* to use another source.
 
+## Benchmark
+
+**Benchmark** (next to Segment) measures this machine:
+- It segments Slicer's CTChest sample with `ts.v2:total_fast` twice. The first run includes the
+  weights' download on first use; the second is the warm number to compare.
+- It records the OS, CPU, RAM, GPU and its memory, driver/CUDA, and the versions of torch,
+  haversack and Slicer.
+- The report is a short Markdown block with one JSON payload. It is copied to the clipboard and
+  saved under `~/.slicer-haversack/benchmarks/`. Paste it into the benchmark issue as a comment.
+
+To collect every report in a thread into a table:
+
+```bash
+python tools/collate_benchmarks.py --issue pieper/SlicerHaversack#<n>          # Markdown table
+python tools/collate_benchmarks.py --issue pieper/SlicerHaversack#<n> --csv    # CSV
+```
+
 ## Settings (Setup → Advanced)
 
-- **Home**: where the environment, the extra models and the run files live.
+- **Home**: where the environment (`env/`), its downloads (`uv-cache/`, `python/`), the extra
+  models, step logs, benchmark reports and run files live.
+- **Output**: `pipe` (default) or `file`, as described under *How it runs*.
 - **haversack**: what `uv pip install` installs. This is a requirement (`haversack @
   git+https://github.com/mhalle/haversack@<branch>`) or a local checkout path, which is
   installed editable. The module needs `haversack segment --json-progress` and `--folds`. If
@@ -83,9 +124,10 @@ as PanTS) are merged, Install takes haversack from `pieper/haversack@slicerhaver
 
 ## Tests
 
-- The Slicer-free parts (the fetcher, the license gate, the environment commands, the
-  catalog): `python -m pytest HaversackSegment/Testing/Python`.
-- In Slicer, the module's self-test also covers the QProcess runner.
+- The Slicer-free parts (the fetcher, the license gate, the environment commands, the catalog,
+  log tailing, uv progress, benchmark reports and the collate script):
+  `python -m pytest HaversackSegment/Testing/Python`.
+- In Slicer, the module's self-test also covers the QProcess runner in both output modes.
 
 ## License
 

@@ -52,6 +52,32 @@ class Environment:
         """Scratch space for one run's input and output files."""
         return self.home / "work"
 
+    @property
+    def logs(self) -> Path:
+        """One log file per step the module runs (install, download, segment)."""
+        return self.home / "logs"
+
+    @property
+    def uv_cache(self) -> Path:
+        """uv's download cache for this module, kept here rather than in uv's shared cache so that
+        Uninstall can remove exactly what the module downloaded."""
+        return self.home / "uv-cache"
+
+    @property
+    def python_dir(self) -> Path:
+        """Where uv puts the managed Python the environment is built on."""
+        return self.home / "python"
+
+    def uv_env(self) -> dict:
+        """Environment variables for every uv command the module runs."""
+        return {"UV_CACHE_DIR": str(self.uv_cache), "UV_PYTHON_INSTALL_DIR": str(self.python_dir)}
+
+    def uninstall_paths(self, downloads: bool) -> list[Path]:
+        """What Uninstall removes: the environment, and with ``downloads`` also uv's cache and the
+        managed Python, so a reinstall downloads everything again. Never the model weights
+        (haversack's, shared with TotalSegmentator) or the extra models in ``models/``."""
+        return [self.venv] + ([self.uv_cache, self.python_dir] if downloads else [])
+
     def _bin(self, name: str) -> Path:
         if sys.platform == "win32":
             return self.venv / "Scripts" / f"{name}.exe"

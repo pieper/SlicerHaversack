@@ -188,3 +188,104 @@ class TestCatalog:
 
     def test_json_output_after_log_lines(self):
         assert catalog.parse_json_output("warning: x\n[1, 2]\n") == [1, 2]
+
+
+# --- progress plumbing, uninstall, benchmark (2026-10-27) ---------------------------------------
+
+from HaversackSegmentLib import benchmark, logtail, stepprogress  # noqa: E402
+
+
+class TestLogTail:
+    def test_lines_arrive_as_they_are_appended(self, tmp_path):
+        p = tmp_path / "step.log"
+        t = logtail.LogTail(p)
+        assert t.read() == []                                   # not created yet
+        with open(p, "wb") as f:
+            f.write(b"first\nsecond, half")
+            f.flush()
+            assert t.read() == ["first"]                        # a partial line waits
+            f.write(" done\r\n\n".encode() + "caf\xc3".encode("latin-1"))
+            f.flush()
+            assert t.read() == ["second, half done"]            # \r dropped, blank skipped
+            f.write(b"\xa9 ok\nlast without newline")           # a UTF-8 character split across reads
+            f.flush()
+            assert t.read() == ["café ok"]
+        assert t.read(final=True) == ["last without newline"]
+        t.close()
+
+
+class TestUvProgress:
+    LINES = ["Resolved 171 packages in 11.06s", "Downloading torch (73.5MiB)",
+             "Downloading cpython-3.12.11-macos-aarch64-none (download) (17.4MiB)",
+             "Downloading numpy (6.5MiB)", " Downloading numpy",
+             "Building haversack @ git+https://github.com/pieper/haversack@x"]
+
+    def test_downloads_drive_the_fraction(self):
+        u = stepprogress.UvProgress()
+        assert u.fraction() is None
+        assert all(u.feed(line) for line in self.LINES)
+        assert not u.feed("anything else")
+        assert set(u.sizes) == {"torch", "cpython-3.12.11-macos-aarch64-none", "numpy"}
+        assert u.finished == {"numpy"}
+        assert abs(u.fraction() - 6.5 / (73.5 + 17.4 + 6.5)) < 1e-6
+        text = u.text()
+        assert "resolved 171 packages" in text and "1 of 3 large files" in text
+        assert "now: torch" in text and "building haversack" in text
+        u.feed(" Built haversack @ git+https://github.com/pieper/haversack@x")
+        assert "building" not in u.text()
+
+    def test_human_units(self):
+        assert stepprogress.human_bytes(512) == "512 B"
+        assert stepprogress.human_bytes(3 << 30) == "3.0 GiB"
+        assert stepprogress.human_seconds(59) == "59s" and stepprogress.human_seconds(125) == "2m 05s"
+
+
+class TestUninstall:
+    def test_paths(self, tmp_path):
+        e = environment.Environment.at(tmp_path)
+        assert e.uninstall_paths(downloads=False) == [e.venv]
+        assert e.uninstall_paths(downloads=True) == [e.venv, e.uv_cache, e.python_dir]
+        assert e.models not in e.uninstall_paths(downloads=True)          # weights are kept
+        assert e.uv_env() == {"UV_CACHE_DIR": str(e.uv_cache), "UV_PYTHON_INSTALL_DIR": str(e.python_dir)}
+
+
+def _report(total=12.5, gpu="NVIDIA GeForce RTX 4090"):
+    return benchmark.build_report(
+        system={"os": "Linux-6.8", "cpu": "AMD EPYC", "ram_bytes": 64 << 30, "gpu": gpu,
+                "gpu_memory_bytes": 24 << 30, "torch": "2.14.1", "haversack": "0.16.0",
+                "cuda_available": True},
+        device="cuda", slicer={"version": "5.12.4"}, module={}, when="2026-10-27T12:00:00Z",
+        runs=[{"run": 1, "wall_s": 40.0, "timings": {"total": 35.0, "weights:ts.v2:total_fast": 20.0}},
+              {"run": 2, "wall_s": total + 3, "timings": {"total": total, "predict:x": 4.0, "load:x": 1.5}}])
+
+
+class TestBenchmark:
+    def test_device_for(self):
+        assert benchmark.device_for({"cuda_available": True, "mps_available": True}) == "cuda"
+        assert benchmark.device_for({"mps_available": True}) == "mps"
+        assert benchmark.device_for({}) == "cpu"
+        assert benchmark.device_for({"cuda_available": True}, "cpu") == "cpu"
+
+    def test_a_pasted_report_reads_back_among_other_text(self):
+        md = benchmark.to_markdown(_report())
+        assert md.startswith("### SlicerHaversack benchmark") and "warm run 12.5 s" in md
+        thread = "Here is mine:\n\n" + md + "\nand some ```python\nprint(1)\n``` code\n" + benchmark.to_markdown(_report(9.0))
+        got = benchmark.parse_reports(thread)
+        assert [r["runs"][-1]["timings"]["total"] for r in got] == [12.5, 9.0]
+        row = benchmark.row(got[0], who="someone")
+        assert set(row) == set(benchmark.COLUMNS)
+        assert row["warm_total_s"] == 12.5 and row["first_total_s"] == 35.0
+        assert row["warm_predict_s"] == 4.0 and row["warm_load_s"] == 1.5
+        assert row["ram_gb"] == 64.0 and row["gpu_mem_gb"] == 24.0 and row["who"] == "someone"
+
+    def test_the_collate_tool_tabulates_files(self, tmp_path):
+        f = tmp_path / "pasted.md"
+        f.write_text(benchmark.to_markdown(_report(20.0)) + benchmark.to_markdown(_report(10.0, gpu="Apple M4")))
+        tool = Path(__file__).resolve().parents[3] / "tools" / "collate_benchmarks.py"
+        out = subprocess.run([sys.executable, str(tool), str(f)], capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        lines = out.stdout.strip().splitlines()
+        assert lines[0].startswith("| when |") and len(lines) == 4
+        assert "Apple M4" in lines[2]                          # fastest warm run first
+        out = subprocess.run([sys.executable, str(tool), "--csv", str(f)], capture_output=True, text=True)
+        assert out.stdout.splitlines()[0].split(",") == list(benchmark.COLUMNS)

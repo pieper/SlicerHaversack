@@ -13,6 +13,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,7 +27,7 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleWidget,
 )
 
-from HaversackSegmentLib import catalog, environment, fetch_model
+from HaversackSegmentLib import benchmark, catalog, environment, fetch_model, stepprogress
 from HaversackSegmentLib.runner import CommandRunner
 
 SETTINGS = "HaversackSegment"
@@ -99,11 +100,25 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
     def removeEnvironment(self):
         shutil.rmtree(self.env.venv, ignore_errors=True)
 
-    def diagnostics(self, verify=False) -> list:
+    def diagnosticsContext(self) -> dict:
+        """What :meth:`diagnostics` needs from Qt and Slicer, read on the main thread so that the
+        report itself can run on another (it starts Python and imports torch, which takes
+        seconds)."""
+        return {"env": self.env, "source": self.haversackSource(), "clean_env": _clean_env(),
+                "slicer": slicer.app.applicationVersion}
+
+    def diagnostics(self, verify=False, ctx=None) -> list:
         """Lines describing the setup, for the log: this process and the hardware, uv, the
-        environment's Python, and (``verify``) torch and haversack in it."""
+        environment's Python, and (``verify``) torch and haversack in it. Touches no Qt object
+        when given ``ctx`` (:meth:`diagnosticsContext`), so it can run off the main thread."""
+        ctx = ctx or self.diagnosticsContext()
+        e, run_env = ctx["env"], ctx["clean_env"]
+
+        def run(command, timeout):
+            return self._run(command, timeout=timeout, env=run_env)
+
         host = environment.host_info()
-        lines = [f"Slicer {slicer.app.applicationVersion}; its Python {host['python']} runs as "
+        lines = [f"Slicer {ctx['slicer']}; its Python {host['python']} runs as "
                  f"{host['process_machine']}"
                  + (" under Rosetta" if host["translated"] else "")
                  + ("; hardware: Apple Silicon" if host["hardware_arm64"] and host["system"] == "Darwin" else ""),
@@ -112,17 +127,15 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
         try:
             import uv
             ub = uv.find_uv_bin()
-            ver = subprocess.run([ub, "--version"], capture_output=True, text=True, timeout=30,
-                                 env=_clean_env()).stdout.strip()
-            lines.append(f"uv: {ub} ({environment.binary_arch(ub)}) {ver}")
+            lines.append(f"uv: {ub} ({environment.binary_arch(ub)}) {run([ub, '--version'], 30).strip()}")
         except Exception as exc:
             lines.append(f"uv: not available in Slicer's Python yet ({exc.__class__.__name__}); Install adds it")
-        e = self.env
+        lines.append(f"uv cache: {e.uv_cache}; managed Python: {e.python_dir}; step logs: {e.logs}")
         if not e.python.exists():
             lines.append(f"environment: none at {e.venv}")
             return lines
         try:
-            probe = self.probeEnvironment()
+            probe = environment.parse_json_line(run(e.probe_command(), 60).splitlines())
             problem = environment.check_probe(probe, host)
             lines.append(f"environment: {e.venv}: Python {probe['version']} runs as {probe['machine']}"
                          + (f" - PROBLEM: {problem}" if problem else " - ok"))
@@ -131,20 +144,20 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
         lines.append(f"haversack: {e.haversack} {'present' if e.haversack.is_file() else 'MISSING'}")
         if verify and e.haversack.is_file():
             try:
-                v = environment.parse_json_line(self._run(e.verify_command(), timeout=300).splitlines())
+                v = environment.parse_json_line(run(e.verify_command(), 300).splitlines())
                 lines.append(f"torch {v['torch']} (cuda {v['cuda']}, mps {v['mps']}), haversack {v['haversack']}")
+                missing = environment.missing_segment_options(run(e.segment_help_command(), 120))
                 lines.append("haversack segment options: " + (
-                    "ok" if not self.missingSegmentOptions() else
-                    "MISSING " + ", ".join(self.missingSegmentOptions()) + " - its source is too old"))
+                    "ok" if not missing else "MISSING " + ", ".join(missing) + " - its source is too old"))
             except Exception as exc:
                 lines.append(f"torch/haversack import check failed: {exc}")
-        lines.append(f"haversack source: {self.haversackSource()}")
+        lines.append(f"haversack source: {ctx['source']}")
         return lines
 
-    def _run(self, command, timeout=120) -> str:
+    def _run(self, command, timeout=120, env=None) -> str:
         """A short command in the haversack environment, its stdout returned."""
         r = subprocess.run([str(c) for c in command], capture_output=True, text=True,
-                           timeout=timeout, env=_clean_env())
+                           timeout=timeout, env=env if env is not None else _clean_env())
         if r.returncode != 0:
             raise RuntimeError(f"{' '.join(map(str, command))} failed:\n{r.stderr.strip()[-2000:]}")
         return r.stdout
@@ -216,6 +229,11 @@ def _clean_env() -> dict:
 # =============================================================================
 
 class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
+    """The panel. Nothing slow runs on Slicer's main thread: installs, downloads, segmentations and
+    the model listing are QProcess steps (:class:`CommandRunner`), Diagnose and Uninstall run on a
+    Python thread, and a one-second heartbeat keeps the status line moving while any of them
+    works."""
+
     def __init__(self, parent=None):
         ScriptedLoadableModuleWidget.__init__(self, parent)
         self.logic = HaversackSegmentLogic()
@@ -225,6 +243,16 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._workDir: Optional[Path] = None
         self._task = None               # what `haversack segment --task` gets for this run
         self._lastDone: Optional[dict] = None
+        self._uv = None                 # stepprogress.UvProgress while a uv step runs
+        self._stepLabel = ""
+        self._stepText = ""
+        self._stepStarted = 0.0
+        self._stepCount = (0, 0)        # (this step, steps in the job)
+        self._installing = False
+        self._background = None         # (label, started, thread) of Diagnose / Uninstall
+        self._quiet: list = []          # runners listing models, alive until they finish
+        self._bench = None
+        self._recent: list = []
 
     # ----- UI construction -----
 
@@ -235,42 +263,64 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self.layout.addWidget(self._buildModelSection())
         self.layout.addWidget(self._buildRunSection())
         self.layout.addWidget(self._buildProgressSection(), 1)
-        self._runner = CommandRunner(self.parent)
+        self._runner = self._newRunner()
         self._runner.progressEvent.connect(self._onEvent)
-        self._runner.logLine.connect(self._log)
+        self._runner.logLine.connect(self._onLogLine)
         self._runner.finished.connect(self._onStepFinished)
+        self._heartbeat = qt.QTimer(self.parent)
+        self._heartbeat.setInterval(1000)
+        self._heartbeat.connect("timeout()", self._onHeartbeat)
+        self._heartbeat.start()
         self._refreshEnvironmentState()
+
+    def _newRunner(self) -> CommandRunner:
+        return CommandRunner(self.parent, log_dir=str(self.logic.env.logs),
+                             output_mode=self.logic.setting("OutputMode", "pipe"))
 
     def _buildSetupSection(self):
         box = ctk_collapsible("Setup")
         form = qt.QFormLayout(box)
-        row = qt.QHBoxLayout()
         self._envStatus = qt.QLabel("checking…")
         self._envStatus.wordWrap = True
+        form.addRow(self._envStatus)
+        row = qt.QHBoxLayout()
         self._installButton = qt.QPushButton("Install")
         self._installButton.toolTip = ("Create the haversack environment (Python 3.12, uv) and "
                                        "install haversack into it; again to update.")
         self._installButton.connect("clicked()", self._onInstallClicked)
+        self._uninstallButton = qt.QPushButton("Uninstall…")
+        self._uninstallButton.toolTip = ("Remove the environment, and optionally what it downloaded, so that "
+                                         "Install starts from nothing. Model weights are kept.")
+        self._uninstallButton.connect("clicked()", self._onUninstallClicked)
         self._diagnoseButton = qt.QPushButton("Diagnose")
         self._diagnoseButton.toolTip = ("Write what this setup is into the log below: Slicer's Python and "
                                         "its architecture, uv, the environment's Python, torch and haversack.")
         self._diagnoseButton.connect("clicked()", self._onDiagnoseClicked)
-        row.addWidget(self._envStatus, 1)
-        row.addWidget(self._installButton, 0)
-        row.addWidget(self._diagnoseButton, 0)
+        for b in (self._installButton, self._uninstallButton, self._diagnoseButton):
+            row.addWidget(b)
         form.addRow(row)
 
         advanced = ctk_collapsible("Advanced", collapsed=True)
         aform = qt.QFormLayout(advanced)
         self._homeEdit = qt.QLineEdit(self.logic.setting("Home", str(environment.DEFAULT_HOME)))
-        self._homeEdit.toolTip = "Holds the environment (env/), extra models (models/) and run files (work/)."
+        self._homeEdit.toolTip = ("Holds the environment (env/), its downloads (uv-cache/, python/), extra "
+                                  "models (models/), step logs (logs/) and run files (work/).")
         self._haversackEdit = qt.QLineEdit(self.logic.haversackSource())
         self._haversackEdit.toolTip = ("What `uv pip install` installs for haversack: a requirement "
                                        "(git URL, @branch) or a local checkout path (installed editable).")
         for edit, key in ((self._homeEdit, "Home"), (self._haversackEdit, "HaversackSource")):
             edit.connect("editingFinished()", lambda e=edit, k=key: self._onSettingEdited(k, e))
+        self._outputCombo = qt.QComboBox()
+        self._outputCombo.addItems(["pipe", "file"])
+        self._outputCombo.setCurrentIndex(max(0, self._outputCombo.findText(self.logic.setting("OutputMode", "pipe"))))
+        self._outputCombo.toolTip = ("How a step's output reaches this panel. pipe: the operating system "
+                                     "signals each line (with a fallback check when it goes quiet). file: "
+                                     "output goes to a log file that is read four times a second - try it "
+                                     "if progress only appears when a step ends.")
+        self._outputCombo.connect("currentIndexChanged(int)", self._onOutputModeChanged)
         aform.addRow("Home:", self._homeEdit)
         aform.addRow("haversack:", self._haversackEdit)
+        aform.addRow("Output:", self._outputCombo)
         form.addRow(advanced)
         return box
 
@@ -299,7 +349,7 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._filterEdit.placeholderText = "filter: name, modality, description…"
         self._filterEdit.connect("textChanged(QString)", self._applyFilter)
         refresh = qt.QPushButton("Refresh")
-        refresh.connect("clicked()", self._populateModels)
+        refresh.connect("clicked()", self._refreshEnvironmentState)
         row.addWidget(self._filterEdit, 1)
         row.addWidget(refresh, 0)
         lay.addLayout(row)
@@ -332,10 +382,16 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._runButton = qt.QPushButton("Segment")
         self._runButton.setDefault(True)
         self._runButton.connect("clicked()", self._onRunClicked)
+        self._benchButton = qt.QPushButton("Benchmark")
+        self._benchButton.toolTip = (f"Segment Slicer's {benchmark.SAMPLE} sample with {benchmark.TASK} twice and "
+                                     "report the timings and this machine (OS, CPU, RAM, GPU) as a block to "
+                                     "paste into a GitHub issue; it is copied to the clipboard.")
+        self._benchButton.connect("clicked()", self._onBenchmarkClicked)
         self._cancelButton = qt.QPushButton("Cancel")
         self._cancelButton.enabled = False
         self._cancelButton.connect("clicked()", self._onCancelClicked)
         row.addWidget(self._runButton, 1)
+        row.addWidget(self._benchButton, 0)
         row.addWidget(self._cancelButton, 0)
         return box
 
@@ -357,8 +413,18 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
 
     # ----- state -----
 
+    def _busy(self) -> bool:
+        return (self._runner is not None and (self._runner.isRunning() or bool(self._steps))) \
+            or self._background is not None
+
     def _refreshEnvironmentState(self):
+        """The environment's status and the model list. Checking haversack and listing its catalog
+        start Python in the environment, which can take seconds, so both run as background steps
+        and fill the panel in when they answer."""
+        if self._busy():
+            return                                   # re-run when the job finishes
         env = self.logic.env
+        extra = catalog.extra_entries(self.logic.extraManifest(), env.models)
         if not env.installed():
             if env.python.exists():
                 self._envStatus.text = (f"{env.venv} exists, but haversack is not installed in it: the last "
@@ -367,25 +433,55 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
             else:
                 self._envStatus.text = f"Not installed. Install creates {env.venv} (about 2 GB with torch)."
             self._installButton.text = "Install"
-        else:
-            try:
-                missing = self.logic.missingSegmentOptions()
-            except Exception as exc:
-                missing = None
-                self._envStatus.text = f"Installed at {env.venv}, but haversack does not start: {exc}"
-            if missing:
-                self._envStatus.text = (f"haversack in {env.venv} is too old for this module (no "
-                                        f"{', '.join(missing)}). Update, or set its source under Advanced.")
-            elif missing is not None:
-                self._envStatus.text = f"Ready: {env.venv}"
-            self._installButton.text = "Update"
-        self._populateModels()
+            self._showModels(extra)
+            return
+        self._installButton.text = "Update"
+        self._envStatus.text = f"Checking haversack in {env.venv}…"
+        self._showModels(self._entries if any(e["kind"] == "haversack" for e in self._entries) else extra)
 
-    def _populateModels(self):
-        self._entries = self.logic.listModels() if self.logic.env.installed() else \
-            catalog.extra_entries(self.logic.extraManifest(), self.logic.env.models)
-        for problem in getattr(self.logic, "listProblems", []) if self.logic.env.installed() else []:
-            self._log(problem)
+        def helpDone(code, status, r):
+            if status != "ok":
+                self._envStatus.text = (f"Installed at {env.venv}, but haversack does not start; "
+                                        "Diagnose says more. Its output:")
+                for line in r.lines[-15:]:
+                    self._log("  " + line)
+                self._showModels(extra)
+                return
+            missing = environment.missing_segment_options("\n".join(r.lines))
+            self._envStatus.text = (f"haversack in {env.venv} is too old for this module (no "
+                                    f"{', '.join(missing)}). Update, or set its source under Advanced."
+                                    if missing else f"Ready: {env.venv}")
+            self._envStatus.text += " Listing models…"
+            self._runQuiet(env.tasks_command(), tasksDone)
+
+        def tasksDone(code, status, r):
+            self._envStatus.text = self._envStatus.text.replace(" Listing models…", "")
+            entries = []
+            try:
+                if status != "ok":
+                    raise RuntimeError("\n".join(r.lines[-10:]))
+                entries = catalog.haversack_entries(catalog.parse_json_output("\n".join(r.stdoutLines)))
+            except Exception as exc:
+                self._log(f"haversack's catalog could not be listed: {exc}")
+            self._showModels(entries + extra)
+
+        self._runQuiet(env.segment_help_command(), helpDone)
+
+    def _runQuiet(self, command, done):
+        """A short background command whose output is collected rather than shown."""
+        r = self._newRunner()
+        r.lines = []
+        r.logLine.connect(lambda line: r.lines.append(line))
+        self._quiet.append(r)
+
+        def finished(code, status):
+            self._quiet.remove(r)
+            done(code, status, r)
+        r.finished.connect(finished)
+        r.start(command, clean_environment=True)
+
+    def _showModels(self, entries):
+        self._entries = list(entries)
         selected = self._selectedEntry()
         self._modelTree.clear()
         groups = {}
@@ -429,33 +525,184 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._refreshRunButton()
 
     def _refreshRunButton(self):
-        busy = self._runner is not None and (self._runner.isRunning() or bool(self._steps))
+        if not hasattr(self, "_cancelButton"):       # the selector signals while the panel is built
+            return
+        busy = self._busy()
         e = self._selectedEntry()
-        why = ("running…" if busy else
-               "Segment needs the environment: click Install under Setup." if not self.logic.env.installed() else
+        installed = self.logic.env.installed()
+        why = ("" if busy else
+               "Segment needs the environment: click Install under Setup." if not installed else
                "Choose a model in the list above." if e is None else
                "Choose an input volume." if self._inputSelector.currentNode() is None else "")
-        self._runButton.enabled = not why
-        self._runHint.text = "" if busy else why
-        self._installButton.enabled = not busy
-        self._diagnoseButton.enabled = not busy
-        self._cancelButton.enabled = busy
+        self._runButton.enabled = not busy and not why
+        self._runHint.text = why
+        for b in (self._installButton, self._uninstallButton, self._diagnoseButton):
+            b.enabled = not busy
+        self._benchButton.enabled = not busy and installed
+        self._cancelButton.enabled = self._runner is not None and (self._runner.isRunning() or bool(self._steps))
 
     def _onSettingEdited(self, key, edit):
         self.logic.setSetting(key, edit.text.strip())
+        self._runner.log_dir = str(self.logic.env.logs)
         self._refreshEnvironmentState()
+
+    def _onOutputModeChanged(self, _index):
+        mode = self._outputCombo.currentText
+        self.logic.setSetting("OutputMode", mode)
+        self._runner.output_mode = mode
+
+    # ----- progress -----
+
+    def _setFraction(self, fraction):
+        """A real fraction moves the bar; None makes it a busy indicator (no fraction known yet)."""
+        if fraction is None:
+            if self._progressBar.maximum != 0:
+                self._progressBar.setRange(0, 0)
+        else:
+            if self._progressBar.maximum == 0:
+                self._progressBar.setRange(0, 100)
+            self._progressBar.setValue(int(100 * min(max(fraction, 0.0), 1.0)))
+
+    def _render(self):
+        """The status line: the current step's own words, how long it has run, and a note when it
+        has been quiet for a while (a big download or a long model load says nothing)."""
+        if self._runner is not None and self._runner.isRunning():
+            n, total = self._stepCount
+            where = f"[{n}/{total}] " if total > 1 else ""
+            elapsed = stepprogress.human_seconds(time.monotonic() - self._stepStarted)
+            quiet = time.monotonic() - self._runner.lastOutput
+            note = f" · no output for {stepprogress.human_seconds(quiet)}, still running" if quiet > 20 else ""
+            self._statusLabel.text = f"{where}{self._stepText} · {elapsed}{note}"
+        elif self._background is not None:
+            label, started, _thread = self._background
+            self._statusLabel.text = f"{label}… {stepprogress.human_seconds(time.monotonic() - started)}"
+
+    def _onHeartbeat(self):
+        self._render()
+
+    def _onLogLine(self, line):
+        self._log(line)
+        if self._uv is not None and self._uv.feed(line):
+            self._stepText = f"{self._stepLabel}: {self._uv.text()}"
+            frac = self._uv.fraction()
+            if frac is not None:
+                self._setFraction(frac)
+            self._render()
+
+    def _onEvent(self, text):
+        ev = json.loads(text)
+        kind = ev.get("event")
+        if ev["source"] == "haversack":
+            if kind == "progress":
+                stage, detail = ev.get("stage") or "", ev.get("detail") or ""
+                if stage == "weights" and ev.get("n_steps"):
+                    # a first use's weights install: its own bytes, not the run's fraction
+                    self._setFraction(ev["step"] / ev["n_steps"])
+                    self._stepText = (f"{self._stepLabel}: downloading weights {detail} "
+                                      f"{stepprogress.human_bytes(ev['step'])} of "
+                                      f"{stepprogress.human_bytes(ev['n_steps'])}")
+                else:
+                    self._setFraction(float(ev.get("fraction") or 0))
+                    steps = f" {ev['step']}/{ev['n_steps']}" if ev.get("n_steps") else ""
+                    parts = f" [part {ev['part'] + 1}/{ev['n_parts']}]" if ev.get("n_parts", 1) > 1 else ""
+                    self._stepText = f"{self._stepLabel}: {stage}{parts}{steps} {detail}".strip()
+                self._render()
+            elif kind == "done":
+                self._lastDone = ev
+            elif kind == "error":
+                self._log(f"haversack error ({ev.get('kind')}): {ev.get('message')}")
+            elif kind == "log":
+                self._log(ev.get("message", ""))
+            return
+        done = ev.get("bytes") if "bytes" in ev else ev.get("bytes_done")
+        total = ev.get("total") if "total" in ev else ev.get("bytes_total")
+        if done is not None and total:
+            self._setFraction(done / total)
+            self._stepText = (f"{self._stepLabel}: {ev.get('file') or ev.get('asset') or ''} "
+                              f"{stepprogress.human_bytes(done)} of {stepprogress.human_bytes(total)}")
+            self._render()
+        elif kind == "error":
+            self._log(f"{ev['source']} error: {ev.get('message')}")
+        else:
+            self._log(f"[{ev['source']}] {kind}")
+
+    # ----- background work on a thread (Diagnose, Uninstall) -----
+
+    def _inBackground(self, label, work, done):
+        """Run ``work()`` on a thread (it must not touch Qt); ``done(result, error)`` on the main
+        thread when it ends."""
+        box = {}
+
+        def target():
+            try:
+                box["result"] = work()
+            except Exception as exc:                 # reported by done()
+                box["error"] = exc
+
+        thread = threading.Thread(target=target, daemon=True)
+        self._background = (label, time.monotonic(), thread)
+        self._setFraction(None)
+        self._refreshRunButton()
+        thread.start()
+
+        def check():
+            if thread.is_alive():
+                qt.QTimer.singleShot(200, check)
+                return
+            self._background = None
+            self._setFraction(0)
+            self._refreshRunButton()
+            done(box.get("result"), box.get("error"))
+        qt.QTimer.singleShot(200, check)
 
     # ----- actions -----
 
     def _onDiagnoseClicked(self):
-        self._status("Diagnosing (checks torch and haversack, which takes a few seconds)…")
-        slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
-        try:
-            for line in self.logic.diagnostics(verify=True):
+        self._log("Diagnosing…")
+        ctx = self.logic.diagnosticsContext()
+
+        def done(lines, error):
+            for line in lines or []:
                 self._log("  " + line)
-        finally:
-            slicer.app.restoreOverrideCursor()
-        self._status("Diagnosis above.")
+            if error is not None:
+                self._log(f"  diagnosis failed: {error}")
+            self._status("Diagnosis above. (Select the log and copy it to share.)")
+        self._inBackground("Diagnosing (starts the environment's Python and imports torch)",
+                           lambda: self.logic.diagnostics(verify=True, ctx=ctx), done)
+
+    def _onUninstallClicked(self):
+        env = self.logic.env
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle("Uninstall haversack's environment")
+        box.setText("Remove the environment so that Install starts again?")
+        box.setInformativeText(
+            f"<p><b>Environment only</b> removes {env.venv}; a reinstall reuses the downloads it "
+            f"kept, so it is quick.</p><p><b>Environment and downloads</b> also removes {env.uv_cache} "
+            f"and {env.python_dir}, so a reinstall downloads everything again (about 2 GB) - the way to "
+            "see Install's progress from the start.</p><p>Model weights are kept either way.</p>")
+        envOnly = box.addButton("Environment only", qt.QMessageBox.AcceptRole)
+        everything = box.addButton("Environment and downloads", qt.QMessageBox.DestructiveRole)
+        box.addButton(qt.QMessageBox.Cancel)
+        box.setDefaultButton(qt.QMessageBox.Cancel)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked not in (envOnly, everything):
+            return
+        paths = env.uninstall_paths(downloads=clicked == everything)
+        self._log("Uninstalling: removing " + ", ".join(str(p) for p in paths))
+
+        def work():
+            for p in paths:
+                shutil.rmtree(p, ignore_errors=True)
+            return [p for p in paths if p.exists()]
+
+        def done(left, error):
+            if error is not None or left:
+                self._status(f"Uninstall did not finish: {error or 'still present: ' + ', '.join(map(str, left))}")
+            else:
+                self._status("Uninstalled. Install sets it up again.")
+            self._refreshEnvironmentState()
+        self._inBackground("Uninstalling (removing files)", work, done)
 
     def _onInstallClicked(self):
         self._logView.clear()
@@ -503,8 +750,21 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
              env.install_command(uv, self.logic.haversackSource()), True, None),
             ("Checking torch and haversack", env.verify_command(), True, checkInstall),
         ]
-        self._onAllDone = self._refreshEnvironmentState
-        self._runNext()
+        self._installing = True
+
+        def installed():
+            self._installing = False
+            self._status("Installed.")
+            self._refreshEnvironmentState()
+        self._onAllDone = installed
+        self._startJob()
+
+    def _prepareInput(self, volume) -> tuple:
+        self._workDir = self.logic.newWorkDir()
+        inPath = self._workDir / "input.nrrd"
+        self._status(f"Saving {volume.GetName()}…")
+        self.logic.saveInput(volume, inPath)
+        return inPath
 
     def _onRunClicked(self):
         e = self._selectedEntry()
@@ -513,16 +773,12 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
             return
         env = self.logic.env
         self._logView.clear()
-        self._lastDone = None
-        self._workDir = self.logic.newWorkDir()
-        inPath = self._workDir / "input.nrrd"
-        outPath = self._workDir / "labels.seg.nrrd"
         try:
-            self._status(f"Saving {volume.GetName()}…")
-            self.logic.saveInput(volume, inPath)
+            inPath = self._prepareInput(volume)
         except Exception as exc:
-            slicer.util.errorDisplay(str(exc))
+            self._status(str(exc))
             return
+        outPath = self._workDir / "labels.seg.nrrd"
         extra = ["--allow-transpose"] if self._transposeCheck.checked else []
         device = self._deviceCombo.currentText
         steps = []
@@ -550,7 +806,79 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
                       lambda: self._loadResult(outPath, e, volume)))
         self._steps = steps
         self._onAllDone = self._finishRun
-        self._runNext()
+        self._startJob()
+
+    def _onBenchmarkClicked(self):
+        """CTChest + ts.v2:total_fast twice, timed, with this machine described; the report goes to
+        the log, the clipboard and a file under the home directory."""
+        env = self.logic.env
+        self._logView.clear()
+        self._status(f"Benchmark: loading the {benchmark.SAMPLE} sample…")
+        try:
+            import SampleData
+            volume = slicer.mrmlScene.GetFirstNodeByName(benchmark.SAMPLE) or SampleData.downloadSample(benchmark.SAMPLE)
+            inPath = self._prepareInput(volume)
+        except Exception as exc:
+            self._status(f"Benchmark: could not prepare the sample: {exc}")
+            return
+        self._bench = {"system": None, "device": None, "runs": [], "requested": self._deviceCombo.currentText}
+
+        def systemRead():
+            self._bench["system"] = environment.parse_json_line(self._runner.stdoutLines)
+            self._bench["device"] = benchmark.device_for(self._bench["system"], self._bench["requested"])
+            s = self._bench["system"]
+            self._log(f"  {s.get('os')} · {s.get('cpu')} · {s.get('gpu') or 'no GPU'} · device {self._bench['device']}")
+
+        def runStep(k):
+            return lambda: env.segment_command(inPath, benchmark.TASK, self._workDir / f"bench-{k}.seg.nrrd",
+                                               device=self._bench["device"])
+
+        def runDone(k):
+            def done():
+                ev = self._lastDone or {}
+                run = {"run": k + 1, "wall_s": round(time.monotonic() - self._stepStarted, 3),
+                       "timings": {key: round(v, 3) for key, v in (ev.get("timings") or {}).items()},
+                       "structures_present": len(ev.get("present") or [])}
+                self._bench["runs"].append(run)
+                self._log(f"  run {k + 1}: haversack total {run['timings'].get('total', 0):.2f} s, "
+                          f"wall {run['wall_s']:.2f} s, {run['structures_present']} structures")
+            return done
+
+        self._steps = [("Benchmark: reading this machine", [str(env.python), "-c", benchmark.SYSTEM_INFO_CODE],
+                        True, systemRead)]
+        for k in range(benchmark.RUNS):
+            what = "first run (includes the weights' download on first use)" if k == 0 else "warm run"
+            self._steps.append((f"Benchmark: {benchmark.TASK} on {benchmark.SAMPLE}, {what}", runStep(k), True,
+                                runDone(k)))
+        self._onAllDone = self._finishBenchmark
+        self._startJob()
+
+    def _finishBenchmark(self):
+        b, self._bench = self._bench, None
+        report = benchmark.build_report(
+            system=b["system"], device=b["device"], runs=b["runs"],
+            slicer={"version": slicer.app.applicationVersion, "revision": slicer.app.revision,
+                    "python": sys.version.split()[0]},
+            module={"haversack_source": self.logic.haversackSource(),
+                    "output_mode": self._runner.output_mode, "device_requested": b["requested"]},
+            when=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        md = benchmark.to_markdown(report)
+        out = self.logic.env.home / "benchmarks" / time.strftime("benchmark-%Y%m%d-%H%M%S.md")
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(md, encoding="utf-8")
+        except OSError as exc:
+            self._log(f"could not save the report: {exc}")
+        qt.QApplication.clipboard().setText(md)
+        self._log("")
+        for line in md.splitlines():
+            self._log(line)
+        self._status(f"Benchmark done: {benchmark.summary_line(report)}. The report is on the clipboard "
+                     f"(paste it into the GitHub issue) and in {out}.")
+        if self._workDir is not None:
+            shutil.rmtree(self._workDir, ignore_errors=True)
+            self._workDir = None
+        self._refreshEnvironmentState()
 
     def _askLicense(self, m) -> bool:
         lic = m["license"]
@@ -572,15 +900,21 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
 
     def _onCancelClicked(self):
         self._steps = []
+        self._bench = None
         if self._runner.isRunning():
             self._runner.cancel()
         self._refreshRunButton()
 
     # ----- the step queue -----
 
+    def _startJob(self):
+        self._stepCount = (0, len(self._steps))
+        self._runNext()
+
     def _runNext(self):
         if not self._steps:
             done, self._onAllDone = getattr(self, "_onAllDone", None), None
+            self._uv = None
             self._refreshRunButton()
             if done:
                 done()
@@ -588,10 +922,19 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         label, command, clean, _onOk = self._steps[0]
         if callable(command):
             command = command()
-        self._status(label + "…")
-        self._progressBar.setValue(0)
-        self._runner.start(command, clean_environment=clean)
+        n, total = self._stepCount
+        self._stepCount = (n + 1, total)
+        self._stepLabel = self._stepText = label
+        self._stepStarted = time.monotonic()
+        self._lastDone = None
+        self._uv = stepprogress.UvProgress() if Path(str(command[0])).name.lower().startswith("uv") else None
+        self._log(label + "…")
+        self._setFraction(None)
+        if self._installing:
+            self._envStatus.text = f"Installing: step {n + 1} of {total}, {label.lower()}…"
+        self._runner.start(command, clean_environment=clean, extra_env=self.logic.env.uv_env())
         self._refreshRunButton()
+        self._render()
 
     def _onStepFinished(self, code, status):
         if not self._steps:                                  # cancelled: the queue was cleared
@@ -614,39 +957,19 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         """End the queue early. A failed run's files stay, for a look at what it was given."""
         self._steps = []
         self._onAllDone = None
+        self._bench = None
+        self._uv = None
+        if self._installing:
+            self._installing = False
+        self._setFraction(0)
         self._status(message)
+        if self._runner.logFile:
+            self._log(f"step log: {self._runner.logFile}")
         if self._workDir is not None:
             self._log(f"run files kept in {self._workDir}")
             self._workDir = None
         self._refreshRunButton()
-
-    def _onEvent(self, text):
-        ev = json.loads(text)
-        kind = ev.get("event")
-        if ev["source"] == "haversack":
-            if kind == "progress":
-                self._progressBar.setValue(int(100 * float(ev.get("fraction") or 0)))
-                steps = f" {ev['step']}/{ev['n_steps']}" if ev.get("n_steps") else ""
-                parts = f" [{ev['part'] + 1}/{ev['n_parts']}]" if ev.get("n_parts", 1) > 1 else ""
-                self._statusLabel.text = f"{ev.get('stage')}{parts}{steps} {ev.get('detail') or ''}".strip()
-            elif kind == "done":
-                self._lastDone = ev
-            elif kind == "error":
-                self._log(f"haversack error ({ev.get('kind')}): {ev.get('message')}")
-                self._statusLabel.text = ev.get("message") or "haversack failed"
-            elif kind == "log":
-                self._log(ev.get("message", ""))
-            return
-        done = ev.get("bytes") if "bytes" in ev else ev.get("bytes_done")
-        total = ev.get("total") if "total" in ev else ev.get("bytes_total")
-        if done is not None and total:
-            self._progressBar.setValue(int(100 * done / total))
-            self._statusLabel.text = (f"downloading {ev.get('file') or ev.get('asset') or ''} "
-                                      f"{done / 1e6:.0f} / {total / 1e6:.0f} MB")
-        elif kind == "error":
-            self._log(f"{ev['source']} error: {ev.get('message')}")
-        else:
-            self._log(f"[{ev['source']}] {kind}")
+        self._refreshEnvironmentState()
 
     # ----- results -----
 
@@ -654,33 +977,35 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         seg = self.logic.loadResult(outPath, entry, volume)
         present = len((self._lastDone or {}).get("present") or [])
         took = ((self._lastDone or {}).get("timings") or {}).get("total")
+        self._setFraction(1.0)
         self._status(f"Loaded {seg.GetName()}: {present} structures"
                      + (f" in {took:.0f} s" if took else "") + ".")
-        self._progressBar.setValue(100)
 
     def _finishRun(self):
         if self._workDir is not None and not self.logic.setting("KeepRunFiles", ""):
             shutil.rmtree(self._workDir, ignore_errors=True)
         self._workDir = None
-        self._populateModels()                      # weights may now be installed
+        self._refreshEnvironmentState()              # weights may now be installed
 
     def _status(self, text):
         self._statusLabel.text = text
         self._log(text)
 
     def _log(self, line):
-        self._recent = (getattr(self, "_recent", []) + [str(line)])[-40:]
+        self._recent = (self._recent + [str(line)])[-40:]
         self._logView.appendPlainText(line)
 
     def _lastError(self) -> str:
         """The failed command's most telling line, for the status: uv's and haversack's errors."""
-        for line in reversed(getattr(self, "_recent", [])):
+        for line in reversed(self._recent):
             low = line.lower()
             if low.startswith(("error", "haversack error", "×", "  ×")) or "error:" in low or "no solution" in low:
                 return ": " + line.strip()[:300]
         return ""
 
     def cleanup(self):
+        if getattr(self, "_heartbeat", None) is not None:
+            self._heartbeat.stop()
         if self._runner is not None and self._runner.isRunning():
             self._steps = []
             self._runner.cancel()
@@ -725,24 +1050,28 @@ class HaversackSegmentTest(ScriptedLoadableModuleTest):
         self.assertFalse(fetch_model.model_folder(m, dest).exists())
 
     def test_runner_parses_events(self):
-        runner = CommandRunner()
-        events, finished = [], []
-        runner.progressEvent.connect(lambda t: events.append(json.loads(t)))
-        runner.finished.connect(lambda c, s: finished.append((c, s)))
-        # a shell, not PythonSlicer, as the stand-in: the test must not depend on the launcher
+        """Both output modes deliver the events, the plain lines and stdout, and say how."""
         lines = ['haversack> {"event": "progress", "fraction": 0.5}', 'fetch> {"event": "done"}',
                  "plain line"]
-        if sys.platform == "win32":
-            script = "echo /some/folder& " + "& ".join(f"echo {l} 1>&2" for l in lines)
-            runner.start(["cmd", "/c", script], clean_environment=True)
-        else:
-            script = "echo /some/folder; " + "; ".join(f"echo '{l}' >&2" for l in lines)
-            runner.start(["/bin/sh", "-c", script], clean_environment=True)
-        deadline = time.time() + 30
-        while not finished and time.time() < deadline:
-            slicer.app.processEvents()
-            time.sleep(0.02)
-        self.assertEqual(finished, [(0, "ok")])
-        self.assertEqual([(e["source"], e["event"]) for e in events],
-                         [("haversack", "progress"), ("fetch", "done")])
-        self.assertEqual(runner.stdoutLines, ["/some/folder"])
+        for mode in ("pipe", "file"):
+            runner = CommandRunner(output_mode=mode)
+            events, finished = [], []
+            runner.progressEvent.connect(lambda t: events.append(json.loads(t)))
+            runner.finished.connect(lambda c, s: finished.append((c, s)))
+            # a shell, not PythonSlicer, as the stand-in: the test must not depend on the launcher
+            if sys.platform == "win32":
+                script = "echo /some/folder& " + "& ".join(f"echo {l} 1>&2" for l in lines)
+                runner.start(["cmd", "/c", script], clean_environment=True)
+            else:
+                script = "echo /some/folder; " + "; ".join(f"echo '{l}' >&2" for l in lines)
+                runner.start(["/bin/sh", "-c", script], clean_environment=True)
+            deadline = time.time() + 30
+            while not finished and time.time() < deadline:
+                slicer.app.processEvents()
+                time.sleep(0.02)
+            self.assertEqual(finished, [(0, "ok")], mode)
+            self.assertEqual([(e["source"], e["event"]) for e in events],
+                             [("haversack", "progress"), ("fetch", "done")], mode)
+            self.assertEqual(runner.stdoutLines, ["/some/folder"], mode)
+            self.assertEqual(sum(v for k, v in runner.delivery.items() if k != "mode"), 4, mode)
+            self.assertTrue(Path(runner.logFile).is_file(), mode)
