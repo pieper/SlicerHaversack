@@ -98,10 +98,11 @@ class Environment:
 
     # -- install -------------------------------------------------------------------------------
 
-    def create_command(self, uv: str, host: dict | None = None) -> list[str]:
+    def create_command(self, uv: str, host: dict | None = None, clear: bool = False) -> list[str]:
         """Create (or keep) the virtual environment with a uv-managed Python 3.12 for the
-        machine's own architecture (:func:`python_request`), downloaded once."""
-        return [uv, "venv", "--allow-existing", "--managed-python",
+        machine's own architecture (:func:`python_request`), downloaded once. ``clear`` replaces
+        an existing one instead (one built for the wrong architecture, or whose Python fails)."""
+        return [uv, "venv", "--clear" if clear else "--allow-existing", "--managed-python",
                 "--python", python_request(host if host is not None else host_info()), str(self.venv)]
 
     def probe_command(self) -> list[str]:

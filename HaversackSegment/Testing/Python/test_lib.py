@@ -140,6 +140,7 @@ class TestEnvironment:
         cmd = environment.Environment.at(tmp_path).create_command("uv", mac)
         assert cmd[:4] == ["uv", "venv", "--allow-existing", "--managed-python"]
         assert cmd[-2] == "cpython-3.12-macos-aarch64-none"
+        assert environment.Environment.at(tmp_path).create_command("uv", mac, clear=True)[2] == "--clear"
         assert "Apple Silicon" in environment.check_probe({"machine": "x86_64", "version": "3.12.11"}, mac)
         assert environment.check_probe({"machine": "arm64", "version": "3.12.11"}, mac) is None
         assert environment.check_probe({"machine": "x86_64", "version": "3.12.3"}, linux) is None
@@ -289,3 +290,50 @@ class TestBenchmark:
         assert "Apple M4" in lines[2]                          # fastest warm run first
         out = subprocess.run([sys.executable, str(tool), "--csv", str(f)], capture_output=True, text=True)
         assert out.stdout.splitlines()[0].split(",") == list(benchmark.COLUMNS)
+
+
+from HaversackSegmentLib import remover  # noqa: E402
+
+
+class TestTreeRemover:
+    def _tree(self, root, n=30):
+        for i in range(n):
+            d = root / f"d{i % 3}" / f"e{i % 5}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"f{i}.txt").write_text("x")
+        return root
+
+    def test_removes_in_small_steps_and_counts(self, tmp_path):
+        a, b = self._tree(tmp_path / "env"), self._tree(tmp_path / "cache", 7)
+        (a / "d0" / "ro.txt").write_text("read-only")
+        (a / "d0" / "ro.txt").chmod(0o444)
+        r = remover.TreeRemover([a, b, tmp_path / "absent"])
+        steps, fractions = 0, []
+        while r.step(budget_s=0):                  # one entry per call
+            steps += 1
+            fractions.append(r.fraction())
+        assert not a.exists() and not b.exists()
+        assert r.done and r.failures == 0 and r.removed == r.total
+        assert steps > r.total                     # counting took steps too
+        known = [f for f in fractions if f is not None]
+        assert known == sorted(known) and r.fraction() == 1.0
+        assert "removed" in r.text()
+
+    def test_symlinks_are_removed_not_followed(self, tmp_path):
+        keep = self._tree(tmp_path / "keep", 4)
+        env = tmp_path / "env"
+        (env / "lib").mkdir(parents=True)
+        try:
+            (env / "lib64").symlink_to(keep, target_is_directory=True)
+            (env / "lib" / "python").symlink_to(keep / "d0" / "e0" / "f0.txt")
+        except OSError:
+            pytest.skip("no symlinks here")
+        r = remover.TreeRemover([env])
+        while r.step():
+            pass
+        assert not env.exists() and r.failures == 0
+        assert len(list(keep.rglob("*.txt"))) == 4
+
+    def test_nothing_to_remove(self, tmp_path):
+        r = remover.TreeRemover([tmp_path / "absent"])
+        assert r.done and not r.step() and r.fraction() is None

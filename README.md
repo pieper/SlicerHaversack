@@ -33,8 +33,10 @@ managed Python under the module's home (`uv-cache/`, `python/`), not in its shar
 For an extra model, `fetch_model.py` downloads the weights first.
 
 Slicer stays usable throughout. Every install, download and segmentation step is a background
-process, and so are the model listing and the version check. Diagnose and Uninstall run on a
-background thread.
+process, and so are the model listing, the version check and Diagnose's checks. Uninstall deletes
+a few hundred files at a time between Slicer's own events. (No Python threads: Slicer's main thread
+holds the GIL while it idles, so a background thread barely runs.) Install, Uninstall and Diagnose
+show their progress under *Setup* as well as under *Progress*.
 - **The status line** shows the step, its elapsed time, and a note when the step has printed
   nothing for a while.
 - **The progress bar** follows what the step reports: uv's downloads (bytes finished of bytes

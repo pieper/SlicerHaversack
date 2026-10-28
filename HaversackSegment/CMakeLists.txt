@@ -10,6 +10,7 @@ set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}Lib/environment.py
   ${MODULE_NAME}Lib/fetch_model.py
   ${MODULE_NAME}Lib/logtail.py
+  ${MODULE_NAME}Lib/remover.py
   ${MODULE_NAME}Lib/runner.py
   ${MODULE_NAME}Lib/stepprogress.py
   )

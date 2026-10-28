@@ -13,7 +13,6 @@ import logging
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -28,6 +27,7 @@ from slicer.ScriptedLoadableModule import (
 )
 
 from HaversackSegmentLib import benchmark, catalog, environment, fetch_model, stepprogress
+from HaversackSegmentLib.remover import TreeRemover
 from HaversackSegmentLib.runner import CommandRunner
 
 SETTINGS = "HaversackSegment"
@@ -100,58 +100,35 @@ class HaversackSegmentLogic(ScriptedLoadableModuleLogic):
     def removeEnvironment(self):
         shutil.rmtree(self.env.venv, ignore_errors=True)
 
-    def diagnosticsContext(self) -> dict:
-        """What :meth:`diagnostics` needs from Qt and Slicer, read on the main thread so that the
-        report itself can run on another (it starts Python and imports torch, which takes
-        seconds)."""
-        return {"env": self.env, "source": self.haversackSource(), "clean_env": _clean_env(),
-                "slicer": slicer.app.applicationVersion}
+    @staticmethod
+    def uvBinaryIfPresent():
+        """uv if Slicer's Python has it already, else None (installs nothing)."""
+        try:
+            import uv
+            return uv.find_uv_bin()
+        except Exception:
+            return None
 
-    def diagnostics(self, verify=False, ctx=None) -> list:
-        """Lines describing the setup, for the log: this process and the hardware, uv, the
-        environment's Python, and (``verify``) torch and haversack in it. Touches no Qt object
-        when given ``ctx`` (:meth:`diagnosticsContext`), so it can run off the main thread."""
-        ctx = ctx or self.diagnosticsContext()
-        e, run_env = ctx["env"], ctx["clean_env"]
-
-        def run(command, timeout):
-            return self._run(command, timeout=timeout, env=run_env)
-
+    def diagnosticsHeader(self) -> list:
+        """The lines of the diagnosis that need no subprocess (instant): this process and the
+        hardware, uv's location, the paths. The rest - uv's version, the environment's Python,
+        torch and haversack - are background steps (the widget's Diagnose)."""
+        e = self.env
         host = environment.host_info()
-        lines = [f"Slicer {ctx['slicer']}; its Python {host['python']} runs as "
+        lines = [f"Slicer {slicer.app.applicationVersion}; its Python {host['python']} runs as "
                  f"{host['process_machine']}"
                  + (" under Rosetta" if host["translated"] else "")
                  + ("; hardware: Apple Silicon" if host["hardware_arm64"] and host["system"] == "Darwin" else ""),
                  f"environment wanted: Python {environment.python_request(host)}"
                  + (f" (must run as {environment.expected_machine(host)})" if environment.expected_machine(host) else "")]
-        try:
-            import uv
-            ub = uv.find_uv_bin()
-            lines.append(f"uv: {ub} ({environment.binary_arch(ub)}) {run([ub, '--version'], 30).strip()}")
-        except Exception as exc:
-            lines.append(f"uv: not available in Slicer's Python yet ({exc.__class__.__name__}); Install adds it")
+        ub = self.uvBinaryIfPresent()
+        lines.append(f"uv: {ub} ({environment.binary_arch(ub)})" if ub else
+                     "uv: not in Slicer's Python yet; Install adds it")
         lines.append(f"uv cache: {e.uv_cache}; managed Python: {e.python_dir}; step logs: {e.logs}")
-        if not e.python.exists():
-            lines.append(f"environment: none at {e.venv}")
-            return lines
-        try:
-            probe = environment.parse_json_line(run(e.probe_command(), 60).splitlines())
-            problem = environment.check_probe(probe, host)
-            lines.append(f"environment: {e.venv}: Python {probe['version']} runs as {probe['machine']}"
-                         + (f" - PROBLEM: {problem}" if problem else " - ok"))
-        except Exception as exc:
-            lines.append(f"environment: {e.venv}: its Python does not run: {exc}")
-        lines.append(f"haversack: {e.haversack} {'present' if e.haversack.is_file() else 'MISSING'}")
-        if verify and e.haversack.is_file():
-            try:
-                v = environment.parse_json_line(run(e.verify_command(), 300).splitlines())
-                lines.append(f"torch {v['torch']} (cuda {v['cuda']}, mps {v['mps']}), haversack {v['haversack']}")
-                missing = environment.missing_segment_options(run(e.segment_help_command(), 120))
-                lines.append("haversack segment options: " + (
-                    "ok" if not missing else "MISSING " + ", ".join(missing) + " - its source is too old"))
-            except Exception as exc:
-                lines.append(f"torch/haversack import check failed: {exc}")
-        lines.append(f"haversack source: {ctx['source']}")
+        lines.append(f"environment: {e.venv}" + ("" if e.python.exists() else " - none"))
+        if e.python.exists():
+            lines.append(f"haversack: {e.haversack} {'present' if e.haversack.is_file() else 'MISSING'}")
+        lines.append(f"haversack source: {self.haversackSource()}")
         return lines
 
     def _run(self, command, timeout=120, env=None) -> str:
@@ -229,16 +206,17 @@ def _clean_env() -> dict:
 # =============================================================================
 
 class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
-    """The panel. Nothing slow runs on Slicer's main thread: installs, downloads, segmentations and
-    the model listing are QProcess steps (:class:`CommandRunner`), Diagnose and Uninstall run on a
-    Python thread, and a one-second heartbeat keeps the status line moving while any of them
-    works."""
+    """The panel. Nothing slow runs on Slicer's main thread: installs, downloads, segmentations,
+    Diagnose's checks and the model listing are QProcess steps (:class:`CommandRunner`), Uninstall
+    deletes a little at a time from a timer (:class:`TreeRemover`), and a one-second heartbeat
+    keeps the status line moving while any of them works. No Python threads: Slicer's main thread
+    holds the GIL while it idles, so a thread hardly runs."""
 
     def __init__(self, parent=None):
         ScriptedLoadableModuleWidget.__init__(self, parent)
         self.logic = HaversackSegmentLogic()
         self._runner: Optional[CommandRunner] = None
-        self._steps: list = []          # (label, command, clean_env, on_ok) still to run
+        self._steps: list = []          # (label, command, clean_env, on_ok[, on_fail[, echo]]) still to run
         self._entries: list = []
         self._workDir: Optional[Path] = None
         self._task = None               # what `haversack segment --task` gets for this run
@@ -248,8 +226,10 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._stepText = ""
         self._stepStarted = 0.0
         self._stepCount = (0, 0)        # (this step, steps in the job)
-        self._installing = False
-        self._background = None         # (label, started, thread) of Diagnose / Uninstall
+        self._setupJob = None           # "Installing" / "Diagnosing" / "Uninstalling": shown under Setup too
+        self._remover = None            # TreeRemover while Uninstall deletes
+        self._removerStarted = 0.0
+        self._onRemoved = None
         self._quiet: list = []          # runners listing models, alive until they finish
         self._bench = None
         self._recent: list = []
@@ -299,6 +279,12 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         for b in (self._installButton, self._uninstallButton, self._diagnoseButton):
             row.addWidget(b)
         form.addRow(row)
+        # Install, Uninstall and Diagnose show their progress here as well as under Progress,
+        # which may be scrolled out of view
+        self._setupBar = qt.QProgressBar()
+        self._setupBar.setRange(0, 100)
+        self._setupBar.visible = False
+        form.addRow(self._setupBar)
 
         advanced = ctk_collapsible("Advanced", collapsed=True)
         aform = qt.QFormLayout(advanced)
@@ -396,7 +382,7 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         return box
 
     def _buildProgressSection(self):
-        box = ctk_collapsible("Progress")
+        box = self._progressBox = ctk_collapsible("Progress")
         lay = qt.QVBoxLayout(box)
         self._statusLabel = qt.QLabel("idle")
         self._statusLabel.wordWrap = True
@@ -415,7 +401,7 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
 
     def _busy(self) -> bool:
         return (self._runner is not None and (self._runner.isRunning() or bool(self._steps))) \
-            or self._background is not None
+            or self._remover is not None
 
     def _refreshEnvironmentState(self):
         """The environment's status and the model list. Checking haversack and listing its catalog
@@ -440,6 +426,8 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._showModels(self._entries if any(e["kind"] == "haversack" for e in self._entries) else extra)
 
         def helpDone(code, status, r):
+            if status == "cancelled":                # Uninstall stopped it
+                return
             if status != "ok":
                 self._envStatus.text = (f"Installed at {env.venv}, but haversack does not start; "
                                         "Diagnose says more. Its output:")
@@ -455,6 +443,8 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
             self._runQuiet(env.tasks_command(), tasksDone)
 
         def tasksDone(code, status, r):
+            if status == "cancelled":
+                return
             self._envStatus.text = self._envStatus.text.replace(" Listing models…", "")
             entries = []
             try:
@@ -539,7 +529,7 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         for b in (self._installButton, self._uninstallButton, self._diagnoseButton):
             b.enabled = not busy
         self._benchButton.enabled = not busy and installed
-        self._cancelButton.enabled = self._runner is not None and (self._runner.isRunning() or bool(self._steps))
+        self._cancelButton.enabled = busy
 
     def _onSettingEdited(self, key, edit):
         self.logic.setSetting(key, edit.text.strip())
@@ -554,14 +544,29 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
     # ----- progress -----
 
     def _setFraction(self, fraction):
-        """A real fraction moves the bar; None makes it a busy indicator (no fraction known yet)."""
-        if fraction is None:
-            if self._progressBar.maximum != 0:
-                self._progressBar.setRange(0, 0)
-        else:
-            if self._progressBar.maximum == 0:
-                self._progressBar.setRange(0, 100)
-            self._progressBar.setValue(int(100 * min(max(fraction, 0.0), 1.0)))
+        """A real fraction moves the bar; None makes it a busy indicator (no fraction known yet).
+        During Install, Uninstall and Diagnose the bar under Setup does the same."""
+        bars = [self._progressBar] + ([self._setupBar] if self._setupJob else [])
+        for bar in bars:
+            if fraction is None:
+                if bar.maximum != 0:
+                    bar.setRange(0, 0)
+            else:
+                if bar.maximum == 0:
+                    bar.setRange(0, 100)
+                bar.setValue(int(100 * min(max(fraction, 0.0), 1.0)))
+
+    def _beginSetupJob(self, name):
+        """Install, Uninstall or Diagnose starts: its progress shows under Setup, and the
+        Progress section opens."""
+        self._setupJob = name
+        self._setupBar.visible = True
+        self._progressBox.collapsed = False
+        self._setFraction(None)
+
+    def _endSetupJob(self):
+        self._setupJob = None
+        self._setupBar.visible = False
 
     def _render(self):
         """The status line: the current step's own words, how long it has run, and a note when it
@@ -572,16 +577,22 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
             elapsed = stepprogress.human_seconds(time.monotonic() - self._stepStarted)
             quiet = time.monotonic() - self._runner.lastOutput
             note = f" · no output for {stepprogress.human_seconds(quiet)}, still running" if quiet > 20 else ""
-            self._statusLabel.text = f"{where}{self._stepText} · {elapsed}{note}"
-        elif self._background is not None:
-            label, started, _thread = self._background
-            self._statusLabel.text = f"{label}… {stepprogress.human_seconds(time.monotonic() - started)}"
+            text = f"{where}{self._stepText} · {elapsed}{note}"
+        elif self._remover is not None:
+            elapsed = stepprogress.human_seconds(time.monotonic() - self._removerStarted)
+            text = f"Uninstalling: {self._remover.text()} · {elapsed}"
+        else:
+            return
+        self._statusLabel.text = text
+        if self._setupJob:
+            self._envStatus.text = text
 
     def _onHeartbeat(self):
         self._render()
 
     def _onLogLine(self, line):
-        self._log(line)
+        if getattr(self, "_echo", True) or line.startswith(("$ ", "output delivery")):
+            self._log(line)
         if self._uv is not None and self._uv.feed(line):
             self._stepText = f"{self._stepLabel}: {self._uv.text()}"
             frac = self._uv.fraction()
@@ -626,49 +637,93 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         else:
             self._log(f"[{ev['source']}] {kind}")
 
-    # ----- background work on a thread (Diagnose, Uninstall) -----
+    # ----- Uninstall's deleting, a little at a time from a timer -----
 
-    def _inBackground(self, label, work, done):
-        """Run ``work()`` on a thread (it must not touch Qt); ``done(result, error)`` on the main
-        thread when it ends."""
-        box = {}
-
-        def target():
-            try:
-                box["result"] = work()
-            except Exception as exc:                 # reported by done()
-                box["error"] = exc
-
-        thread = threading.Thread(target=target, daemon=True)
-        self._background = (label, time.monotonic(), thread)
+    def _removeInSteps(self, paths, done):
+        """Delete ``paths`` with :class:`TreeRemover`, about 40 ms of work per timer tick so Slicer
+        keeps answering; ``done(remover)`` when it ends (or is cancelled)."""
+        self._remover = TreeRemover(paths)
+        self._removerStarted = time.monotonic()
+        self._onRemoved = done
         self._setFraction(None)
         self._refreshRunButton()
-        thread.start()
+        self._render()
+        qt.QTimer.singleShot(0, self._removeSome)
 
-        def check():
-            if thread.is_alive():
-                qt.QTimer.singleShot(200, check)
-                return
-            self._background = None
-            self._setFraction(0)
-            self._refreshRunButton()
-            done(box.get("result"), box.get("error"))
-        qt.QTimer.singleShot(200, check)
+    def _removeSome(self):
+        r = self._remover
+        if r is None:                                    # cancelled
+            return
+        more = r.step(0.04)
+        self._setFraction(r.fraction())
+        if more:
+            qt.QTimer.singleShot(10, self._removeSome)   # let Slicer handle its events between
+            return
+        self._render()
+        self._finishRemoving()
+
+    def _finishRemoving(self):
+        r, done = self._remover, self._onRemoved
+        self._remover, self._onRemoved = None, None
+        self._refreshRunButton()
+        if done:
+            done(r)
 
     # ----- actions -----
 
     def _onDiagnoseClicked(self):
-        self._log("Diagnosing…")
-        ctx = self.logic.diagnosticsContext()
+        """The instant part first, then uv, the environment's Python, torch and haversack as
+        background steps; a check that fails is reported and the next one still runs."""
+        env = self.logic.env
+        self._beginSetupJob("Diagnosing")
+        self._log("Diagnosis:")
+        for line in self.logic.diagnosticsHeader():
+            self._log("  " + line)
+        host = environment.host_info()
 
-        def done(lines, error):
-            for line in lines or []:
-                self._log("  " + line)
-            if error is not None:
-                self._log(f"  diagnosis failed: {error}")
-            self._status("Diagnosis above. (Select the log and copy it to share.)")
-        self._inBackground("Diagnosing (starts the environment's Python and imports torch)",
-                           lambda: self.logic.diagnostics(verify=True, ctx=ctx), done)
+        def out():
+            return "\n".join(self._runner.stdoutLines)
+
+        def failed(what):
+            return lambda: self._log(f"  {what} - FAILED (its output is above)")
+
+        def probeOk():
+            probe = environment.parse_json_line(self._runner.stdoutLines)
+            problem = environment.check_probe(probe, host)
+            self._log(f"  environment Python {probe['version']} runs as {probe['machine']}"
+                      + (f" - PROBLEM: {problem}" if problem else " - ok"))
+
+        def verifyOk():
+            v = environment.parse_json_line(self._runner.stdoutLines)
+            self._log(f"  torch {v['torch']} (cuda {v['cuda']}, mps {v['mps']}), haversack {v['haversack']}")
+
+        def helpOk():
+            missing = environment.missing_segment_options(out())
+            self._log("  haversack segment options: " + (
+                "ok" if not missing else "MISSING " + ", ".join(missing) + " - its source is too old"))
+
+        steps = []
+        uv = self.logic.uvBinaryIfPresent()
+        if uv:
+            steps.append(("Diagnosing: uv's version", [uv, "--version"], True,
+                          lambda: self._log("  " + out().strip()), failed("uv --version")))
+        if env.python.exists():
+            steps.append(("Diagnosing: the environment's Python", env.probe_command(), True, probeOk,
+                          failed("the environment's Python does not run")))
+            if env.haversack.is_file():
+                steps.append(("Diagnosing: importing torch and haversack (can take a minute the first time)",
+                              env.verify_command(), True, verifyOk, failed("importing torch and haversack")))
+                steps.append(("Diagnosing: haversack segment --help", env.segment_help_command(), True, helpOk,
+                              failed("haversack segment --help"), False))
+        self._steps = steps
+
+        def diagnosed():
+            self._endSetupJob()
+            self._setFraction(1.0)
+            self._status("Diagnosis is in the log below. (Select it and copy it to share.)")
+            self._refreshEnvironmentState()
+        self._onAllDone = diagnosed
+        self._startJob()
 
     def _onUninstallClicked(self):
         env = self.logic.env
@@ -688,45 +743,62 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         clicked = box.clickedButton()
         if clicked not in (envOnly, everything):
             return
+        # the model listing runs the environment's Python, which Windows will not let us delete
+        for r in list(self._quiet):
+            r.cancel()
         paths = env.uninstall_paths(downloads=clicked == everything)
+        self._logView.clear()
+        self._beginSetupJob("Uninstalling")
         self._log("Uninstalling: removing " + ", ".join(str(p) for p in paths))
 
-        def work():
-            for p in paths:
-                shutil.rmtree(p, ignore_errors=True)
-            return [p for p in paths if p.exists()]
-
-        def done(left, error):
-            if error is not None or left:
-                self._status(f"Uninstall did not finish: {error or 'still present: ' + ', '.join(map(str, left))}")
+        def done(r):
+            self._endSetupJob()
+            left = [p for p in paths if p.exists()]
+            if r.done and not r.failures and not left:
+                self._setFraction(1.0)
+                self._status(f"Uninstalled ({r.text()}). Install sets it up again.")
             else:
-                self._status("Uninstalled. Install sets it up again.")
+                for path, message in r.failed:
+                    self._log(f"  could not remove {path}: {message}")
+                why = ("stopped" if not r.done else
+                       f"{r.failures:,} files or folders could not be removed (in use? a program from the "
+                       "environment may still run - close it, or restart Slicer, and Uninstall again)")
+                self._setFraction(0)
+                self._status(f"Uninstall {why}; still present: {', '.join(map(str, left)) or 'nothing'}.")
             self._refreshEnvironmentState()
-        self._inBackground("Uninstalling (removing files)", work, done)
+        self._removeInSteps(paths, done)
 
     def _onInstallClicked(self):
         self._logView.clear()
         env = self.logic.env
         host = environment.host_info()
-        self._status("Installing uv into Slicer's Python…")
+        self._beginSetupJob("Installing")
+        self._status("Installing: adding uv to Slicer's Python…")
+        slicer.app.processEvents()                       # show that before pip_install blocks
         try:
             uv = self.logic.uvBinary()
         except Exception as exc:
             logging.exception("uv install failed")
+            self._endSetupJob()
             self._status(f"Could not install uv into Slicer's Python: {exc}")
+            self._refreshEnvironmentState()
             return
-        for line in self.logic.diagnostics():
+        for line in self.logic.diagnosticsHeader():
             self._log("  " + line)
         # --allow-existing keeps an environment as it is, so one built for the wrong architecture
-        # (an x86_64 Python on Apple Silicon, from a Slicer under Rosetta) is removed first
-        if env.python.exists():
-            try:
-                problem = environment.check_probe(self.logic.probeEnvironment(), host)
-            except Exception as exc:
-                problem = f"its Python does not run ({exc})"
+        # (an x86_64 Python on Apple Silicon, from a Slicer under Rosetta), or whose Python does
+        # not start, is replaced (--clear) by the create step
+        replace = {"yes": False}
+
+        def existingOk():
+            problem = environment.check_probe(environment.parse_json_line(self._runner.stdoutLines), host)
             if problem:
-                self._log(f"Removing {env.venv}: {problem}")
-                self.logic.removeEnvironment()
+                self._log(f"  replacing {env.venv}: {problem}")
+                replace["yes"] = True
+
+        def existingFailed():
+            self._log(f"  replacing {env.venv}: its Python does not run")
+            replace["yes"] = True
 
         def checkPython():
             probe = environment.parse_json_line(self._runner.stdoutLines)
@@ -742,18 +814,20 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
             if environment.expected_machine(host) == "arm64" and not v["mps"]:
                 self._log("  note: torch does not see the Apple GPU (MPS); segmentation will use the CPU")
 
-        self._steps = [
-            (f"Creating the environment (Python {environment.python_request(host)})",
-             env.create_command(uv, host), True, None),
-            ("Checking the environment's Python", env.probe_command(), True, checkPython),
+        steps = [("Installing: checking the existing environment", env.probe_command(), True,
+                  existingOk, existingFailed)] if env.python.exists() else []
+        self._steps = steps + [
+            (f"Installing: creating the environment (Python {environment.python_request(host)})",
+             lambda: env.create_command(uv, host, clear=replace["yes"]), True, None),
+            ("Installing: checking the environment's Python", env.probe_command(), True, checkPython),
             ("Installing haversack (several minutes and about 2 GB the first time)",
              env.install_command(uv, self.logic.haversackSource()), True, None),
-            ("Checking torch and haversack", env.verify_command(), True, checkInstall),
+            ("Installing: checking torch and haversack", env.verify_command(), True, checkInstall),
         ]
-        self._installing = True
 
         def installed():
-            self._installing = False
+            self._endSetupJob()
+            self._setFraction(1.0)
             self._status("Installed.")
             self._refreshEnvironmentState()
         self._onAllDone = installed
@@ -903,6 +977,8 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._bench = None
         if self._runner.isRunning():
             self._runner.cancel()
+        if self._remover is not None:
+            self._finishRemoving()                       # done() reports what is left
         self._refreshRunButton()
 
     # ----- the step queue -----
@@ -919,7 +995,8 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
             if done:
                 done()
             return
-        label, command, clean, _onOk = self._steps[0]
+        label, command, clean = self._steps[0][:3]
+        self._echo = len(self._steps[0]) < 6 or self._steps[0][5]   # False: output only in the step log
         if callable(command):
             command = command()
         n, total = self._stepCount
@@ -930,8 +1007,6 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._uv = stepprogress.UvProgress() if Path(str(command[0])).name.lower().startswith("uv") else None
         self._log(label + "…")
         self._setFraction(None)
-        if self._installing:
-            self._envStatus.text = f"Installing: step {n + 1} of {total}, {label.lower()}…"
         self._runner.start(command, clean_environment=clean, extra_env=self.logic.env.uv_env())
         self._refreshRunButton()
         self._render()
@@ -940,7 +1015,13 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         if not self._steps:                                  # cancelled: the queue was cleared
             self._stopRun(f"Cancelled ({status}).")
             return
-        label, _command, _clean, onOk = self._steps.pop(0)
+        step = self._steps.pop(0)
+        label, onOk = step[0], step[3]
+        onFail = step[4] if len(step) > 4 else None      # a check whose failure is only reported
+        if status != "ok" and onFail is not None and status != "cancelled":
+            onFail()
+            self._runNext()
+            return
         if status != "ok":
             self._stopRun(f"{label} {status} (exit {code}){self._lastError()}; the log below has the rest.")
             return
@@ -959,9 +1040,8 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         self._onAllDone = None
         self._bench = None
         self._uv = None
-        if self._installing:
-            self._installing = False
         self._setFraction(0)
+        self._endSetupJob()
         self._status(message)
         if self._runner.logFile:
             self._log(f"step log: {self._runner.logFile}")
@@ -1009,6 +1089,7 @@ class HaversackSegmentWidget(ScriptedLoadableModuleWidget):
         if self._runner is not None and self._runner.isRunning():
             self._steps = []
             self._runner.cancel()
+        self._remover = None
 
 
 def ctk_collapsible(title, collapsed=False):
